@@ -1,0 +1,793 @@
+"""Ladder step 5: closed-loop evaluation of the served pi0.5 policy in Isaac.
+
+Deploy contract, all verified against the running server and robotics_lab (see CLAUDE.md):
+
+  server   pi05_pika_umi_wrist_velgrip_k1_h24_80k on :8001
+  obs      observation/{left,right}_wrist_0_rgb  (full 640x480 RGB; the SERVER does
+           resize_with_pad to 224x224, so do not pre-resize here)
+           observation/state = 14-D velocity_grip
+               [pos_vel3, rot_vel3, grip] per arm, left block then right block
+           prompt = the fixed task sentence
+  actions  (24, 14) per-step ee_local deltas; gripper dims 6/13 in /100 units
+
+Two choices that are easy to get wrong and are deliberate here:
+
+  * velproprio_source = "command". The velocity fed to the policy comes from the
+    history of EMITTED absolute TCP targets, NOT from measured motion. Hold ticks
+    re-append the last target (ZOH) so a stationary command decays to zero velocity.
+    Feeding measured motion instead would hand the policy a feedback channel the
+    demonstrations never had.
+  * chunk_anchor = "command". Chunk deltas integrate onto the last COMMANDED pose,
+    not the measured one.
+
+Control is the Ruckig chunk follower (not the CM controller), with the limits from
+rb_servo_server/config/stack_real.yaml `ruckig_follower`.
+
+Run:
+  OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$HOME/workspace/openpi/packages/openpi-client/src \\
+    .venv-isaac/bin/python scripts/eval_closed_loop.py --episodes 20 --layout aligned
+"""
+
+import argparse
+import json
+import math
+import pathlib
+import time
+
+import os
+import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+ARM_USD = ROOT / "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda"
+STAND_USD = ROOT / "assets/dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usda"
+
+PROMPT = (
+    "pick up the black bolt with the right arm and put it in the right box, "
+    "then pick up the gray bolt with the left arm and put it in the left box"
+)
+
+RESET = {
+    "left": [259.0, 75.6, 129.5, -55.6, -131.2, -161.7],
+    "right": [-253.7, -76.9, -127.6, 65.7, 143.7, 166.9],
+}
+ARM_JOINTS = [
+    "base_joint",
+    "shoulder_joint",
+    "elbow_joint",
+    "wrist1_joint",
+    "wrist2_joint",
+    "wrist3_joint",
+]
+MOUNT_FRAME = {"left": "stand_left_arm_base", "right": "stand_right_arm_base"}
+
+# ---- scene (same numbers as build_scene.py) ---------------------------------
+SHAFT_R, SHAFT_L = 0.006, 0.025
+HEAD_R, HEAD_L = 0.0092, 0.012
+TABLE = dict(cx=0.55, cy=0.0, hx=0.50, hy=0.55, thick=0.012)
+PILE_X, PILE_DY = 0.47, 0.16
+BOX_X, BOX_DY = 0.72, 0.215
+BOX = dict(hw=0.120, hd=0.190, wall_h=0.0525, t=0.020, floor_t=0.0065, sponge_h=0.030)
+ARM_OF_COLOR = {"gray": "left", "black": "right"}
+# top-view left box is green (black bolts), right is gray (gray bolts)
+BOX_CY = {"gray": +BOX_DY, "black": -BOX_DY}
+
+# ---- deploy parameters (from the operator's flow_infer command) -------------
+POLICY_DT = 0.0334          # --policy-dt-sec, 30 Hz
+ACTION_HORIZON = 24
+CHUNK_EXECUTE_STEPS = 4     # FLOW_INFER_CHUNK_EXECUTE_STEPS
+SPEED_SCALE = 1.0
+# FLOW_INFER_RTC=1 in the deploy command. NOTE: with RTC on, robotics_lab sets
+# _chunk_crossfade_steps = 0 (openpi_remote.py:592) -- RTC replaces the crossfade,
+# it is not used alongside it. RTC pins the new chunk's first `inference_delay`
+# rows to the PREVIOUS plan's unexecuted tail, which is what keeps velocity
+# continuous across the 133 ms chunk boundary. Without it every boundary is a
+# fresh plan with no continuity constraint -- visible as residual tremor.
+RESERVE_STEPS = 4   # stack_real.yaml reserve_steps; lookahead for the central
+                    # difference that gives each knot a nonzero target VELOCITY
+RTC_ENABLED = False   # isolate the follower fix first (operator: solve tremor before RTC)
+RTC_INFERENCE_DELAY = 4     # = execute_steps - prefetch_at (4 - 0)
+FINGER_TRAVEL_M = 0.047
+# ee_local r_align: pika_rz180 = diag(-1,-1,+1), applied to BOTH linear and angular
+R_ALIGN = np.diag([-1.0, -1.0, 1.0])
+
+# ---- Ruckig follower limits (stack_real.yaml: safety.ruckig_follower) -------
+LIN_V, LIN_A, LIN_J = 0.45, 12.0, 4000.0
+ANG_V, ANG_A, ANG_J = 0.90, 40.0, 8000.0
+
+PHYSICS_DT = 1.0 / 500.0    # real servo rate
+# rb3_730e.urdf gives every arm joint velocity=3.14159 rad/s. Clipping the IK step
+# to that budget per substep is what stops the command outrunning the drives:
+# the previous +-0.05 rad per 2 ms was 25 rad/s, ~8x the limit, so the joints
+# saturated, tracking error grew, and the chunk-boundary re-anchor then jumped --
+# which shows up as visible tremor (real hardware does not shake).
+# Physical joint travel of the sim robot (rb3_730e.urdf). PhysX enforces these, so a
+# command that runs past them cannot be reached: the joint pins at the stop while the
+# IK keeps integrating, and the command-anchored chunk drifts away without bound.
+# Measured before this clamp existed: left j1 spent 74% of an episode past +6.2832
+# (up to 6.841) and the command ended 635 mm from the robot.
+# rb_servo_server does the same thing in SafetyFilter::clampJointLimits (safety_filter.cpp:251):
+#   out[i] = std::clamp(out[i], q_min_deg[i], q_max_deg[i])
+JOINT_LO = np.array([-6.2832, -6.2832, -2.618, -6.2832, -6.2832, -6.2832])
+JOINT_HI = -JOINT_LO
+# stack_real.yaml dq_max_deg_s [170,170,170,240,240,320] -> rad/s, per joint
+JOINT_VEL_LIMIT = np.deg2rad([170.0, 170.0, 170.0, 240.0, 240.0, 320.0])
+DQ_MAX = JOINT_VEL_LIMIT * PHYSICS_DT
+DIAG = os.environ.get("TREMOR_DIAG") == "1"
+# Replay drives the recorded joint-command stream verbatim, so the bolts-vs-no-bolts
+# comparison differs ONLY by contact. The free-space run without this was useless:
+# with no bolts the policy commanded unreachable poses (141-350 mm off), so the two
+# conditions were not running the same trajectory at all.
+REPLAY = os.environ.get("TREMOR_REPLAY")
+_REP = np.load(REPLAY) if REPLAY else None
+if _REP is not None:
+    # Fail loudly at startup: a diag npz recorded before joint logging existed has no
+    # *_q, and the KeyError deep in the loop left Isaac hung until the 1200 s timeout.
+    _missing = [k for k in ("left_q", "left_gq", "right_q", "right_gq") if k not in _REP]
+    if _missing:
+        raise SystemExit(f"TREMOR_REPLAY={REPLAY} lacks {_missing}; re-record with TREMOR_DIAG=1")
+IK_ITERS = 3        # DLS iterations per substep; one was not converging
+SUBSTEPS = int(round(POLICY_DT / PHYSICS_DT))   # 17
+
+
+def rotvec_to_mat(r):
+    th = float(np.linalg.norm(r))
+    if th < 1e-12:
+        return np.eye(3)
+    k = r / th
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * (K @ K)
+
+
+def mat_to_rotvec(R):
+    c = (np.trace(R) - 1.0) / 2.0
+    c = float(np.clip(c, -1.0, 1.0))
+    th = math.acos(c)
+    if th < 1e-9:
+        return np.zeros(3)
+    if abs(math.pi - th) < 1e-6:
+        # near-pi: use the symmetric part
+        w, V = np.linalg.eigh((R + np.eye(3)) / 2.0)
+        axis = V[:, int(np.argmax(w))]
+        return axis * th
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return v * (th / (2.0 * math.sin(th)))
+
+
+def quat_to_mat(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+
+# ---- analytic arm kinematics ------------------------------------------------
+# Taken straight from rb3_730e.urdf. Using the URDF chain rather than PhysX
+# Jacobians because SingleArticulation exposes none (only the batched Articulation
+# class does), and an analytic Jacobian is both exact and far cheaper at 500 Hz.
+# Each entry is (origin_xyz, origin_rpy, axis); the joint rotation applies AFTER
+# the origin transform. Verified at runtime against the physics TCP pose.
+URDF_CHAIN = [
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 1.5708), None),            # link0_fixed
+    ((0.0, 0.0, 0.1453), (0.0, 0.0, -1.5708), (0, 0, 1)),   # base_joint
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0, 1, 0)),          # shoulder_joint
+    ((0.0, -0.00645, 0.286), (0.0, 0.0, 0.0), (0, 1, 0)),   # elbow_joint
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0, 0, 1)),          # wrist1_joint
+    ((0.0, 0.0, 0.344), (0.0, 0.0, 0.0), (0, 1, 0)),        # wrist2_joint
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0, 0, 1)),          # wrist3_joint
+]
+TOOL_Z = 0.1 + 0.247642   # attachment_site + tcp
+
+
+def _rpy(r, p, y):
+    cr, sr, cp, sp, cy, sy = (math.cos(r), math.sin(r), math.cos(p),
+                              math.sin(p), math.cos(y), math.sin(y))
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ])
+
+
+def _axis_rot(axis, q):
+    return rotvec_to_mat(np.array(axis, dtype=float) * q)
+
+
+def fk_chain(q, T_mount):
+    """Return (tcp_pos, tcp_R, joint_origins, joint_axes) in world."""
+    T = np.array(T_mount, dtype=float)
+    origins, axes = [], []
+    qi = 0
+    for xyz, rpy, ax in URDF_CHAIN:
+        M = np.eye(4)
+        M[:3, :3] = _rpy(*rpy)
+        M[:3, 3] = xyz
+        T = T @ M
+        if ax is not None:
+            origins.append(T[:3, 3].copy())
+            axes.append((T[:3, :3] @ np.array(ax, dtype=float)).copy())
+            R = np.eye(4)
+            R[:3, :3] = _axis_rot(ax, q[qi])
+            T = T @ R
+            qi += 1
+    Tt = np.eye(4)
+    Tt[2, 3] = TOOL_Z
+    T = T @ Tt
+    return T[:3, 3].copy(), T[:3, :3].copy(), origins, axes
+
+
+def jacobian(q, T_mount):
+    p_e, _, origins, axes = fk_chain(q, T_mount)
+    J = np.zeros((6, 6))
+    for i, (o, a) in enumerate(zip(origins, axes)):
+        J[:3, i] = np.cross(a, p_e - o)
+        J[3:, i] = a
+    return J
+
+
+class RuckigArmFollower:
+    """Jerk-limited 6-DOF Cartesian follower, one per arm.
+
+    Mirrors rb_servo_server's cartesian_chunk_follower: a Ruckig p/v/a chain drives the
+    Cartesian reference toward the active knot, re-targeted at each 33 ms boundary.
+    Orientation is carried as a rotvec so the per-axis angular limits apply the same way
+    the C++ AxisLimit does.
+    """
+
+    def __init__(self, pose0):
+        from ruckig import InputParameter, OutputParameter, Ruckig
+
+        self.otg = Ruckig(6, PHYSICS_DT)
+        self.inp = InputParameter(6)
+        self.out = OutputParameter(6)
+        self.inp.max_velocity = [LIN_V] * 3 + [ANG_V] * 3
+        self.inp.max_acceleration = [LIN_A] * 3 + [ANG_A] * 3
+        self.inp.max_jerk = [LIN_J] * 3 + [ANG_J] * 3
+        self.inp.current_position = list(pose0)
+        self.inp.current_velocity = [0.0] * 6
+        self.inp.current_acceleration = [0.0] * 6
+        self.inp.target_position = list(pose0)
+        self.inp.target_velocity = [0.0] * 6
+        self.reference = np.array(pose0, dtype=float)
+
+    def set_target(self, pose, vel=None):
+        """Target a knot WITH a velocity.
+
+        chunk_window.hpp keeps `reserve_R` steps of lookahead precisely so each knot can
+        be given a central-difference target velocity. Leaving target_velocity at zero
+        makes Ruckig decelerate to a full stop at every 33 ms knot: the arm accelerates
+        and brakes 30 times a second, which is exactly the tremor the real robot does not
+        have (it flows through knots at speed).
+        """
+        self.inp.target_position = [float(v) for v in pose]
+        if vel is None or os.environ.get("TREMOR_BASELINE") == "1":
+            self.inp.target_velocity = [0.0] * 6   # old behaviour: stop at every knot
+        else:
+            self.inp.target_velocity = [float(v) for v in vel]
+
+    def step(self):
+        from ruckig import Result
+
+        res = self.otg.update(self.inp, self.out)
+        self.out.pass_to_input(self.inp)
+        self.reference = np.array(self.out.new_position, dtype=float)
+        return res in (Result.Working, Result.Finished)
+
+
+def bolt_poses(layout, n_per, seed):
+    rng = np.random.default_rng(seed)
+    out = []
+    if layout == "aligned":
+        for color, sy in (("gray", +1.0), ("black", -1.0)):
+            for _ in range(n_per):
+                out.append((color, PILE_X + rng.normal(0, 0.045),
+                            sy * PILE_DY + rng.normal(0, 0.05), rng.uniform(0, math.pi)))
+    else:
+        colors = ["gray"] * n_per + ["black"] * n_per
+        rng.shuffle(colors)
+        for color in colors:
+            out.append((color, PILE_X + rng.normal(0, 0.07),
+                        rng.uniform(-0.30, 0.30), rng.uniform(0, math.pi)))
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--episodes", type=int, default=20)
+    ap.add_argument("--layout", choices=["aligned", "random"], default="aligned")
+    ap.add_argument("--seed", type=int, default=100)
+    ap.add_argument("--n-per-color", type=int, default=10,
+                    help="bolts per colour; the real cell has ~20 bolts piled up")
+    ap.add_argument("--episode-sec", type=float, default=40.0)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8001)
+    ap.add_argument("--video", action="store_true", default=True)
+    ap.add_argument("--no-video", dest="video", action="store_false")
+    ap.add_argument("--tag", default="ep")
+    args = ap.parse_args()
+
+    from isaacsim import SimulationApp
+
+    app = SimulationApp({"headless": True})
+
+    import imageio.v2 as imageio
+    import omni.replicator.core as rep
+    from isaacsim.core.api import World
+    from isaacsim.core.prims import RigidPrim, SingleArticulation
+    from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
+    from isaacsim.core.utils.types import ArticulationAction
+    from isaacsim.sensors.camera import Camera
+    from openpi_client import websocket_client_policy
+    from PIL import Image
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
+
+    outdir = ROOT / "outputs/eval"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # rendering_dt MUST be given. It defaults to 1/60 s, so with physics_dt=1/500 every
+    # render step advanced the timeline by 8.33 physics steps: recording a frame once per
+    # policy tick injected a ~6.6 mm TCP jump (measured max 6.58 mm = 3.3 m/s, impossible
+    # for a 0.45 m/s command) at exactly 30 Hz. Replaying the identical joint stream with
+    # --no-video showed none of it (max step 1.80 mm).
+    world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT,
+                  rendering_dt=PHYSICS_DT)
+    stage = get_current_stage()
+
+    def mat(path, rgb, rough=0.5, metallic=0.0):
+        m = UsdShade.Material.Define(stage, path)
+        sh = UsdShade.Shader.Define(stage, path + "/S")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(rough)
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
+        m.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+        return m
+
+    MAT = {
+        "table": mat("/World/m/table", (0.42, 0.44, 0.45), 0.42, 0.65),
+        "green": mat("/World/m/green", (0.10, 0.38, 0.27), 0.45),
+        "boxgray": mat("/World/m/boxgray", (0.46, 0.47, 0.49), 0.50, 0.35),
+        "insert": mat("/World/m/insert", (0.26, 0.26, 0.28), 0.85),
+        "bolt_gray": mat("/World/m/bgray", (0.52, 0.53, 0.56), 0.32, 1.0),
+        "bolt_black": mat("/World/m/bblack", (0.07, 0.07, 0.08), 0.42, 0.9),
+    }
+
+    def sbox(path, c, h, key):
+        cu = UsdGeom.Cube.Define(stage, path)
+        cu.CreateSizeAttr(2.0)
+        UsdGeom.Xformable(cu).AddTransformOp().Set(
+            Gf.Matrix4d().SetScale(Gf.Vec3d(*h)) * Gf.Matrix4d().SetTranslate(Gf.Vec3d(*c))
+        )
+        UsdPhysics.CollisionAPI.Apply(cu.GetPrim())
+        UsdShade.MaterialBindingAPI(cu.GetPrim()).Bind(MAT[key])
+
+    add_reference_to_stage(usd_path=str(STAND_USD), prim_path="/World/cell/stand")
+    mount_xf = {}
+    for prim in stage.Traverse():
+        for side, frame in MOUNT_FRAME.items():
+            if prim.GetName() == frame and side not in mount_xf:
+                mount_xf[side] = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+                    Usd.TimeCode.Default())
+    for side, m in mount_xf.items():
+        p = f"/World/cell/{side}_arm"
+        UsdGeom.Xform.Define(stage, p).MakeMatrixXform().Set(m)
+        add_reference_to_stage(usd_path=str(ARM_USD), prim_path=f"{p}/robot")
+
+    sbox("/World/scene/table", (TABLE["cx"], TABLE["cy"], -TABLE["thick"]),
+         (TABLE["hx"], TABLE["hy"], TABLE["thick"]), "table")
+    b = BOX
+    for name, color, wall in (("box_gray", "gray", "boxgray"), ("box_green", "black", "green")):
+        cy = BOX_CY[color]
+        r = f"/World/scene/{name}"
+        UsdGeom.Xform.Define(stage, r)
+        sbox(f"{r}/floor", (BOX_X, cy, b["floor_t"] / 2),
+             (b["hw"], b["hd"], b["floor_t"] / 2), wall)
+        sbox(f"{r}/sponge", (BOX_X, cy, b["floor_t"] + b["sponge_h"] / 2),
+             (b["hw"] - b["t"], b["hd"] - b["t"], b["sponge_h"] / 2), "insert")
+        h = b["wall_h"]
+        for tag, off, half in (("xm", (-b["hw"], 0), (b["t"], b["hd"], h)),
+                               ("xp", (+b["hw"], 0), (b["t"], b["hd"], h)),
+                               ("ym", (0, -b["hd"]), (b["hw"], b["t"], h)),
+                               ("yp", (0, +b["hd"]), (b["hw"], b["t"], h))):
+            sbox(f"{r}/w_{tag}", (BOX_X + off[0], cy + off[1], h), half, wall)
+
+    n_bolts = args.n_per_color * 2
+    bolt_prims = []
+    for i in range(n_bolts):
+        path = f"/World/scene/bolt_{i:02d}"
+        xf = UsdGeom.Xform.Define(stage, path)
+        xf.MakeMatrixXform().Set(Gf.Matrix4d().SetTranslate(Gf.Vec3d(0.4, 0, 0.05 + 0.05 * i)))
+        prim = xf.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+        UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(0.022)
+        for tag, rr, hl, cx in (("shaft", SHAFT_R, SHAFT_L / 2, SHAFT_L / 2),
+                                ("head", HEAD_R, HEAD_L / 2, -HEAD_L / 2)):
+            cy_ = UsdGeom.Cylinder.Define(stage, f"{path}/{tag}")
+            cy_.CreateRadiusAttr(rr)
+            cy_.CreateHeightAttr(hl * 2)
+            cy_.CreateAxisAttr("X")
+            UsdGeom.Xformable(cy_).AddTranslateOp().Set(Gf.Vec3d(cx, 0, 0))
+            UsdPhysics.CollisionAPI.Apply(cy_.GetPrim())
+        bolt_prims.append(path)
+
+    key = UsdLux.DistantLight.Define(stage, "/World/key")
+    key.CreateIntensityAttr(600.0)
+    key.CreateAngleAttr(12.0)
+    UsdLux.DomeLight.Define(stage, "/World/dome").CreateIntensityAttr(520.0)
+
+    arts = {}
+    for side in MOUNT_FRAME:
+        a = SingleArticulation(prim_path=f"/World/cell/{side}_arm/robot", name=f"{side}_arm")
+        world.scene.add(a)
+        arts[side] = a
+    world.reset()
+    for a in arts.values():
+        a.initialize()
+
+    bolt_views = {p: RigidPrim(prim_paths_expr=p, name=f"bv{i}")
+                  for i, p in enumerate(bolt_prims)}
+    for v in bolt_views.values():
+        v.initialize()
+
+    tcp_views, wrist_cams = {}, {}
+    LENS = (0.00917, 0.04601, 0.11930)
+    for side in MOUNT_FRAME:
+        root = f"/World/cell/{side}_arm/robot"
+        tcp_path = next(str(p.GetPath()) for p in stage.Traverse()
+                        if str(p.GetPath()).startswith(root) and p.GetName() == "tcp"
+                        and p.HasAPI(UsdPhysics.RigidBodyAPI))
+        v = RigidPrim(prim_paths_expr=tcp_path, name=f"tcp_{side}")
+        v.initialize()
+        tcp_views[side] = v
+        tool_path = next(str(p.GetPath()) for p in stage.Traverse()
+                         if str(p.GetPath()).startswith(root) and p.GetName() == "tool"
+                         and p.HasAPI(UsdPhysics.RigidBodyAPI))
+        cam = Camera(prim_path=f"{tool_path}/wrist_cam", name=f"d405_{side}",
+                     resolution=(640, 480))
+        cam.initialize()
+        cam.set_local_pose(translation=np.array(LENS),
+                           orientation=np.array([0.0, 0.0, 0.0, 1.0]),  # 180 deg roll
+                           camera_axes="ros")
+        cam.prim.GetAttribute("focalLength").Set(11.0)
+        cam.prim.GetAttribute("horizontalAperture").Set(20.955)
+        cam.prim.GetAttribute("verticalAperture").Set(20.955 * 480 / 640)
+        cam.prim.GetAttribute("clippingRange").Set(Gf.Vec2f(0.004, 100.0))
+        wrist_cams[side] = cam
+
+    ov = rep.create.camera(position=(1.85, -1.35, 1.15), look_at=(0.55, 0.0, 0.15),
+                           clipping_range=(0.01, 100.0))
+    ov_rp = rep.create.render_product(ov, (960, 720))
+    ov_ann = rep.AnnotatorRegistry.get_annotator("rgb")
+    ov_ann.attach([ov_rp])
+
+    client = websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
+    print(f"connected to {args.host}:{args.port}")
+    print(f"server metadata: {client.get_server_metadata()}")
+
+    def tcp_pose(side):
+        pos, quat = tcp_views[side].get_world_poses()
+        p = np.asarray(pos)[0].astype(float)
+        R = quat_to_mat(np.asarray(quat)[0].astype(float))
+        return p, R
+
+    def set_arm(side, q_arm, grip):
+        art = arts[side]
+        names = list(art.dof_names)
+        q = np.array(art.get_joint_positions(), dtype=np.float32)
+        for j, val in zip(ARM_JOINTS, q_arm):
+            q[names.index(j)] = val
+        fp = (1.0 - grip / 100.0) * FINGER_TRAVEL_M
+        for jn, sgn in (("finger_left_joint", +1.0), ("finger_right_joint", -1.0)):
+            if jn in names:
+                q[names.index(jn)] = sgn * fp
+        art.apply_action(ArticulationAction(joint_positions=q))
+
+    T_mount = {}
+    for side, m in mount_xf.items():
+        T_mount[side] = np.array([[m[i][j] for j in range(4)] for i in range(4)]).T
+
+    results = []
+    for ep in range(args.episodes):
+        ep_seed = args.seed + ep
+        # ---- reset -----------------------------------------------------------
+        for side, art in arts.items():
+            names = list(art.dof_names)
+            q = np.zeros(len(names), dtype=np.float32)
+            for j, deg in zip(ARM_JOINTS, RESET[side]):
+                q[names.index(j)] = np.deg2rad(deg)
+            art.set_joint_positions(q)
+            art.set_joint_velocities(np.zeros_like(q))
+            # kp=1e7 at a 2 ms step is extremely stiff; expose it so the tremor can be
+            # tested against drive stiffness instead of assumed innocent.
+            _kp = float(os.environ.get("TREMOR_KP", 1.0e7))
+            _kd = float(os.environ.get("TREMOR_KD", 1.0e5))
+            art.get_articulation_controller().set_gains(
+                kps=np.full(len(names), _kp), kds=np.full(len(names), _kd))
+            art.apply_action(ArticulationAction(joint_positions=q))
+
+        poses = bolt_poses(args.layout, args.n_per_color, ep_seed)
+        colors = [c for c, *_ in poses]
+        for (color, x, y, yaw), path in zip(poses, bolt_prims):
+            v = bolt_views[path]
+            qz = np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
+            v.set_world_poses(np.array([[x, y, SHAFT_R + 0.002]]), np.array([qz]))
+            v.set_velocities(np.zeros((1, 6)))
+        for i, path in enumerate(bolt_prims):
+            UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(path + "/shaft")).Bind(
+                MAT["bolt_gray" if colors[i] == "gray" else "bolt_black"])
+            UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(path + "/head")).Bind(
+                MAT["bolt_gray" if colors[i] == "gray" else "bolt_black"])
+        for _ in range(240):
+            world.step(render=False)
+        if ep == 0:
+            for i, path in enumerate(bolt_prims):
+                bp = np.asarray(bolt_views[path].get_world_poses()[0])[0]
+                print(f"  bolt {i} {colors[i]:5s} -> ({bp[0]:+.3f},{bp[1]:+.3f},{bp[2]:+.3f})")
+
+        # ---- follower + command state ---------------------------------------
+        followers, cmd_hist, grip_cmd, q_cmd = {}, {}, {}, {}
+        for side in MOUNT_FRAME:
+            q_cmd[side] = np.deg2rad(np.array(RESET[side], dtype=float))
+            p_fk, R_fk, _, _ = fk_chain(q_cmd[side], T_mount[side])
+            p_ph, _ = tcp_pose(side)
+            d = float(np.linalg.norm(p_fk - p_ph))
+            if ep == 0:
+                print(f"  FK check {side:5s}: analytic vs physics TCP = {d*1000:.3f} mm")
+            p, R = tcp_pose(side)
+            pose6 = np.concatenate([p, mat_to_rotvec(R)])
+            followers[side] = RuckigArmFollower(pose6)
+            cmd_hist[side] = [pose6.copy(), pose6.copy()]
+            grip_cmd[side] = 100.0
+
+        frames = []
+        n_ticks = int(args.episode_sec / POLICY_DT)
+        chunk = {s: None for s in MOUNT_FRAME}
+        chunk_idx = 0
+        knots = {s_: None for s_ in MOUNT_FRAME}
+        tcp_log = {s_: [] for s_ in MOUNT_FRAME}
+        sub_i = -1
+        dg = {s_: {k: [] for k in ("dq", "res", "smin", "grip", "refz", "cmdtcp", "q", "gq")}
+              for s_ in MOUNT_FRAME}
+        rtc_prev_raw = None      # reset per episode, like _rtc_prev_raw_chunk
+        rtc_warned = False
+        infer_ms = []
+
+        for tick in range(n_ticks):
+            # ---- observation (velproprio_source=command, fixed_step) ---------
+            # velocity_grip proprio, exactly the training converter's _arm_velocity
+            # (openpi_remote._proprio_state_velocity):
+            #     pos_vel = R_cur^T . (p_next - p_cur)      BODY frame, previous pose
+            #     rot_vel = rotvec(R_cur^T . R_next)
+            # It is a PER-STEP displacement in the previous body frame -- NOT divided by
+            # dt (the fixed_step window already is one ~policy_dt frame), and NOT a world
+            # vector. Dividing by dt fed the policy ~30x inflated numbers. R_align maps
+            # the RB TCP frame to the EE (pika tip) frame the checkpoint trained in.
+            state = np.zeros(14, dtype=np.float32)
+            for bi, side in enumerate(("left", "right")):
+                h = cmd_hist[side]
+                p_cur, p_next = h[-2][:3], h[-1][:3]
+                R_cur, R_next = rotvec_to_mat(h[-2][3:]), rotvec_to_mat(h[-1][3:])
+                pos_vel = R_cur.T @ (p_next - p_cur)
+                rot_vel = mat_to_rotvec(R_cur.T @ R_next)
+                state[bi * 7 + 0: bi * 7 + 3] = R_ALIGN @ pos_vel
+                state[bi * 7 + 3: bi * 7 + 6] = R_ALIGN @ rot_vel
+                state[bi * 7 + 6] = grip_cmd[side] / 100.0
+
+            if chunk["left"] is None or chunk_idx >= CHUNK_EXECUTE_STEPS:
+                imgs = {}
+                for side in ("left", "right"):
+                    a = wrist_cams[side].get_rgba()
+                    arr = np.asarray(a) if a is not None else None
+                    if arr is None or arr.size == 0:
+                        arr = np.zeros((480, 640, 4), dtype=np.uint8)
+                    imgs[side] = arr[..., :3].astype(np.uint8)
+                obs = {
+                    "observation/left_wrist_0_rgb": imgs["left"],
+                    "observation/right_wrist_0_rgb": imgs["right"],
+                    "observation/state": state,
+                    "prompt": PROMPT,
+                }
+                if RTC_ENABLED and rtc_prev_raw is not None:
+                    # rtc_shift_prev_chunk: advance the cached raw chunk by the steps that
+                    # will have executed when the new chunk takes over, so the freeze pins
+                    # to the UNEXECUTED tail rather than replaying old actions.
+                    steps = int(max(0, min(CHUNK_EXECUTE_STEPS, rtc_prev_raw.shape[0])))
+                    pad = np.zeros((steps, rtc_prev_raw.shape[1]), dtype=rtc_prev_raw.dtype)
+                    obs["prev_action_chunk"] = np.concatenate([rtc_prev_raw[steps:], pad], axis=0)
+                    obs["inference_delay"] = int(np.clip(RTC_INFERENCE_DELAY, 0,
+                                                         CHUNK_EXECUTE_STEPS))
+                t0 = time.time()
+                res = client.infer(obs)
+                infer_ms.append((time.time() - t0) * 1e3)
+                if RTC_ENABLED:
+                    raw = res.get("rtc_raw_actions")
+                    if raw is not None:
+                        rtc_prev_raw = np.asarray(raw, dtype=np.float32)
+                    elif not rtc_warned:
+                        print("  [rtc] server returned no 'rtc_raw_actions' -> staying vanilla")
+                        rtc_warned = True
+                act = np.asarray(res["actions"], dtype=float)   # (H, 14)
+                for bi, side in enumerate(("left", "right")):
+                    chunk[side] = act[:, bi * 7: bi * 7 + 7]
+                chunk_idx = 0
+
+            # ---- integrate ee_local delta onto the COMMAND anchor -------------
+            # flow_inference._target_payload_for_arm RE-ANCHORS at every chunk
+            # boundary (steps_since_boundary == 0) instead of free-running the
+            # accumulator. Without this the command drifts away from the robot --
+            # measured here as x 0.359 -> 0.224 m over 4 s with 150-428 mm tracking
+            # error. chunk_anchor="command" makes the anchor FK(q_sent).
+            if chunk_idx == 0:
+                for side in ("left", "right"):
+                    p_a, R_a, _, _ = fk_chain(q_cmd[side], T_mount[side])
+                    anchor_pose = np.concatenate([p_a, mat_to_rotvec(R_a)])
+                    cmd_hist[side][-1] = anchor_pose
+                    # Integrate the whole horizon into absolute knots so the follower can
+                    # look ahead; knots[0] is the anchor itself.
+                    ks = [anchor_pose.copy()]
+                    cur_p, cur_R = anchor_pose[:3].copy(), rotvec_to_mat(anchor_pose[3:])
+                    for r in chunk[side]:
+                        dl = R_ALIGN @ r[:3] * SPEED_SCALE
+                        da = R_ALIGN @ r[3:6] * SPEED_SCALE
+                        nl, na = np.linalg.norm(dl), np.linalg.norm(da)
+                        if nl > LIN_V * POLICY_DT:
+                            dl = dl * (LIN_V * POLICY_DT / nl)
+                        if na > ANG_V * POLICY_DT:
+                            da = da * (ANG_V * POLICY_DT / na)
+                        cur_p = cur_p + cur_R @ dl
+                        cur_R = cur_R @ rotvec_to_mat(da)
+                        ks.append(np.concatenate([cur_p, mat_to_rotvec(cur_R)]))
+                    knots[side] = ks
+            for side in ("left", "right"):
+                ks = knots[side]
+                k = min(chunk_idx + 1, len(ks) - 1)          # knot for this policy step
+                new_pose = ks[k]
+                # central difference over the reserve lookahead -> target velocity
+                lo = max(0, k - 1)
+                hi = min(len(ks) - 1, k + min(RESERVE_STEPS, 1))
+                tvel = (ks[hi] - ks[lo]) / (max(1, hi - lo) * POLICY_DT)
+                tvel[:3] = np.clip(tvel[:3], -LIN_V, LIN_V)
+                tvel[3:] = np.clip(tvel[3:], -ANG_V, ANG_V)
+                cmd_hist[side].append(new_pose.copy())
+                if len(cmd_hist[side]) > 64:
+                    cmd_hist[side].pop(0)
+                followers[side].set_target(new_pose, tvel)
+                row = chunk[side][min(chunk_idx, chunk[side].shape[0] - 1)]
+                grip_cmd[side] = float(np.clip(row[6] * 100.0, 0.0, 100.0))
+            chunk_idx += 1
+
+            # ---- servo: Ruckig reference -> IK -> drives ----------------------
+            for _ in range(SUBSTEPS):
+                sub_i += 1
+                for side in ("left", "right"):
+                    followers[side].step()
+                    ref = followers[side].reference
+                    qc = q_cmd[side]
+                    p_fk, R_fk, _, _ = fk_chain(qc, T_mount[side])
+                    err = np.concatenate([ref[:3] - p_fk,
+                                          mat_to_rotvec(rotvec_to_mat(ref[3:]) @ R_fk.T)])
+                    for _ in range(IK_ITERS):
+                        J = jacobian(qc, T_mount[side])
+                        dq = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err)
+                        qc = np.clip(qc + np.clip(dq, -DQ_MAX, DQ_MAX), JOINT_LO, JOINT_HI)
+                        p_fk, R_fk, _, _ = fk_chain(qc, T_mount[side])
+                        err = np.concatenate([ref[:3] - p_fk,
+                                              mat_to_rotvec(rotvec_to_mat(ref[3:]) @ R_fk.T)])
+                    q_cmd[side] = qc
+                    if _REP is not None:
+                        gi = min(sub_i, len(_REP[f"{side}_q"]) - 1)
+                        q_cmd[side] = _REP[f"{side}_q"][gi].copy()
+                        grip_cmd[side] = float(_REP[f"{side}_gq"][gi])
+                    set_arm(side, q_cmd[side], grip_cmd[side])
+                    if DIAG:
+                        # sigma_min exposes a near-singular wrist, where DLS damping turns
+                        # a small Cartesian error into a large, sign-flipping joint step.
+                        dg[side]["dq"].append(float(np.abs(dq).max()))
+                        dg[side]["res"].append(float(np.linalg.norm(err[:3])))
+                        dg[side]["smin"].append(
+                            float(np.linalg.svd(J, compute_uv=False)[-1]))
+                        dg[side]["grip"].append(grip_cmd[side])
+                        dg[side]["refz"].append(float(ref[2]))
+                        # The decisive split: COMMANDED tcp (analytic FK of the joint
+                        # command) vs MEASURED tcp. If commanded is smooth while measured
+                        # shakes, the tremor is physics/contact, not the controller.
+                        dg[side]["cmdtcp"].append(
+                            fk_chain(q_cmd[side], T_mount[side])[0].copy())
+                        dg[side]["q"].append(q_cmd[side].copy())
+                        dg[side]["gq"].append(grip_cmd[side])
+                world.step(render=False)
+                # Sample at the PHYSICS rate, not the policy rate. The tremor lives INSIDE
+                # the 33 ms knot interval (accelerate then brake across 17 substeps);
+                # sampling once per knot aliases it away completely, which is why the first
+                # version of this metric was blind to the very thing it was measuring.
+                for side in ("left", "right"):
+                    tcp_log[side].append(tcp_pose(side)[0].copy())
+
+            if ep == 0 and tick % 30 == 0:
+                dbg = []
+                for side in ("left", "right"):
+                    p_ph, _ = tcp_pose(side)
+                    ref = followers[side].reference[:3]
+                    cmd = cmd_hist[side][-1][:3]
+                    dbg.append(f"{side[0]}: cmd=({cmd[0]:+.3f},{cmd[1]:+.3f},{cmd[2]:+.3f}) "
+                               f"track_err={np.linalg.norm(ref - p_ph)*1000:5.1f}mm "
+                               f"grip={grip_cmd[side]:5.1f}")
+                print(f"  t{tick:04d} " + " | ".join(dbg))
+
+            if args.video:
+                for _ in range(2):
+                    rep.orchestrator.step(rt_subframes=1, pause_timeline=False)
+                    fr = np.asarray(ov_ann.get_data())
+                    if fr.size:
+                        frames.append(fr[..., :3].astype(np.uint8))
+                        break
+
+        # ---- score ------------------------------------------------------------
+        placed, misplaced = 0, 0
+        for i, path in enumerate(bolt_prims):
+            pos, _ = bolt_views[path].get_world_poses()
+            p = np.asarray(pos)[0]
+            for col, cy in BOX_CY.items():
+                inside = (abs(p[0] - BOX_X) <= BOX["hw"]) and (abs(p[1] - cy) <= BOX["hd"])
+                if inside:
+                    if col == colors[i]:
+                        placed += 1
+                    else:
+                        misplaced += 1
+        tremor, knotband = {}, {}
+        for side in ("left", "right"):
+            P = np.asarray(tcp_log[side])
+            if len(P) > 64:
+                d2 = np.diff(P, n=2, axis=0)
+                # micrometres per physics step^2
+                tremor[side] = float(np.sqrt((d2 ** 2).sum(axis=1).mean()) * 1e6)
+                # how much of the speed signal sits at the 30 Hz knot rate and its harmonic
+                spd = np.linalg.norm(np.diff(P, axis=0), axis=1) / PHYSICS_DT
+                spd = spd - spd.mean()
+                freq = np.fft.rfftfreq(len(spd), PHYSICS_DT)
+                mag = np.abs(np.fft.rfft(spd)) ** 2
+                tot = mag[freq > 0.5].sum()
+                f0 = 1.0 / POLICY_DT
+                band = ((np.abs(freq - f0) < 3.0) | (np.abs(freq - 2 * f0) < 3.0))
+                knotband[side] = float(mag[band].sum() / tot * 100.0) if tot > 0 else 0.0
+        print("          tremor RMS |d2 TCP| : "
+              + "  ".join(f"{k}={v:.1f} um" for k, v in tremor.items())
+              + " | knot-rate energy: "
+              + "  ".join(f"{k}={v:.1f}%" for k, v in knotband.items()))
+        if DIAG:
+            np.savez(outdir / f"diag_{args.tag}_{ep:02d}.npz",
+                     **{f"{sd}_{k}": np.asarray(v)
+                        for sd, d in dg.items() for k, v in d.items()},
+                     **{f"{sd}_tcp": np.asarray(tcp_log[sd]) for sd in dg})
+            print(f"          diag -> diag_{args.tag}_{ep:02d}.npz")
+        rec = dict(episode=ep, seed=ep_seed, layout=args.layout, bolts=n_bolts,
+                   tremor_um=tremor, knot_energy_pct=knotband,
+                   placed_correct=placed, placed_wrong=misplaced,
+                   infer_ms_p50=float(np.median(infer_ms)) if infer_ms else None,
+                   infers=len(infer_ms))
+        results.append(rec)
+        print(f"[ep {ep:02d}] correct={placed} wrong={misplaced} "
+              f"infer_p50={rec['infer_ms_p50']:.0f}ms n_infer={len(infer_ms)}")
+
+        if args.video and frames:
+            vp = outdir / f"{args.tag}_{args.layout}_{ep:02d}.mp4"
+            imageio.mimwrite(vp, frames, fps=30, quality=6)
+            print(f"          video {vp.name} ({len(frames)} frames)")
+
+    summary = dict(
+        episodes=args.episodes, layout=args.layout,
+        total_correct=sum(r["placed_correct"] for r in results),
+        total_wrong=sum(r["placed_wrong"] for r in results),
+        episodes_with_any_correct=sum(1 for r in results if r["placed_correct"] > 0),
+        records=results,
+    )
+    (outdir / f"summary_{args.tag}_{args.layout}.json").write_text(json.dumps(summary, indent=1))
+    print(json.dumps({k: v for k, v in summary.items() if k != "records"}, indent=1))
+    app.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

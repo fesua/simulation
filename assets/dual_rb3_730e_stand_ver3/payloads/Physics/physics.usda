@@ -1,0 +1,166 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "dual_rb3_730e_stand_ver3"
+    doc = """Generated from Composed Stage of root layer /tmp/tmpz7iksy08/dual_rb3_730e_stand_ver3.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_dual_rb3_730e_stand_ver3_fl2fh3zo/usdex_dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_dual_rb3_730e_stand_ver3_fl2fh3zo/temp_dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+over "dual_rb3_730e_stand_ver3"
+{
+    over "Geometry"
+    {
+        over "world"
+        {
+            over "base" (
+                prepend apiSchemas = ["PhysicsArticulationRootAPI", "NewtonArticulationRootAPI"]
+            )
+            {
+                bool newton:selfCollisionEnabled = 0
+
+                over "base_site" (
+                    prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+                )
+                {
+                }
+
+                over "stand" (
+                    prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+                )
+                {
+                    over "stand_base_col" (
+                        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+                    )
+                    {
+                        over "box" (
+                            prepend apiSchemas = ["NewtonCollisionAPI"]
+                        )
+                        {
+                        }
+
+                        over "box_1" (
+                            prepend apiSchemas = ["NewtonCollisionAPI"]
+                        )
+                        {
+                        }
+
+                        over "stand_body_upper" (
+                            prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+                        )
+                        {
+                            over "box" (
+                                prepend apiSchemas = ["NewtonCollisionAPI"]
+                            )
+                            {
+                            }
+
+                            over "stand_body_shoulder" (
+                                prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+                            )
+                            {
+                                over "box" (
+                                    prepend apiSchemas = ["NewtonCollisionAPI"]
+                                )
+                                {
+                                }
+
+                                over "box_1" (
+                                    prepend apiSchemas = ["NewtonCollisionAPI"]
+                                )
+                                {
+                                }
+
+                                over "box_2" (
+                                    prepend apiSchemas = ["NewtonCollisionAPI"]
+                                )
+                                {
+                                }
+
+                                over "box_3" (
+                                    prepend apiSchemas = ["NewtonCollisionAPI"]
+                                )
+                                {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    over "Physics"
+    {
+        def PhysicsFixedJoint "base_site_joint"
+        {
+            custom rel physics:body0
+            prepend rel physics:body0 = </dual_rb3_730e_stand_ver3/Geometry/world/base>
+            custom rel physics:body1
+            prepend rel physics:body1 = </dual_rb3_730e_stand_ver3/Geometry/world/base/base_site>
+            point3f physics:localPos0 = (0, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsFixedJoint "stand_fixed"
+        {
+            custom rel physics:body0
+            prepend rel physics:body0 = </dual_rb3_730e_stand_ver3/Geometry/world/base>
+            custom rel physics:body1
+            prepend rel physics:body1 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand>
+            point3f physics:localPos0 = (0, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (0.70711255, 0, 0, 0.707101)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsFixedJoint "stand_base_col_fixed"
+        {
+            custom rel physics:body0
+            prepend rel physics:body0 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand>
+            custom rel physics:body1
+            prepend rel physics:body1 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col>
+            point3f physics:localPos0 = (0, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (0.70711255, 0, 0, -0.707101)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsFixedJoint "stand_body_upper_fixed"
+        {
+            custom rel physics:body0
+            prepend rel physics:body0 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col>
+            custom rel physics:body1
+            prepend rel physics:body1 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col/stand_body_upper>
+            point3f physics:localPos0 = (0, 0, 0.41)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (0.92387956, 0, 0.38268337, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsFixedJoint "stand_body_shoulder_fixed"
+        {
+            custom rel physics:body0
+            prepend rel physics:body0 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col/stand_body_upper>
+            custom rel physics:body1
+            prepend rel physics:body1 = </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col/stand_body_upper/stand_body_shoulder>
+            point3f physics:localPos0 = (-5.551115e-17, 0, 0.2025)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+    }
+}
+

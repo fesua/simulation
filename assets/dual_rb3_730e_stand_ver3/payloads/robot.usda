@@ -1,0 +1,123 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "dual_rb3_730e_stand_ver3"
+    doc = """Generated from Composed Stage of root layer /tmp/tmpz7iksy08/dual_rb3_730e_stand_ver3.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_dual_rb3_730e_stand_ver3_fl2fh3zo/usdex_dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_dual_rb3_730e_stand_ver3_fl2fh3zo/temp_dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+over "dual_rb3_730e_stand_ver3" (
+    prepend apiSchemas = ["IsaacRobotAPI"]
+)
+{
+    prepend rel isaac:physics:robotJoints = [
+        </dual_rb3_730e_stand_ver3/Physics/base_site_joint>,
+        </dual_rb3_730e_stand_ver3/Physics/stand_fixed>,
+        </dual_rb3_730e_stand_ver3/Physics/stand_base_col_fixed>,
+        </dual_rb3_730e_stand_ver3/Physics/stand_body_upper_fixed>,
+        </dual_rb3_730e_stand_ver3/Physics/stand_body_shoulder_fixed>,
+    ]
+    prepend rel isaac:physics:robotLinks = [
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_left_arm_base>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_right_arm_base>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/base_site>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col/stand_body_upper>,
+        </dual_rb3_730e_stand_ver3/Geometry/world/base/stand/stand_base_col/stand_body_upper/stand_body_shoulder>,
+    ]
+    token isaac:robotType = "Default"
+
+    over "Geometry"
+    {
+        over "world"
+        {
+            over "base"
+            {
+                over "base_site" (
+                    prepend apiSchemas = ["IsaacLinkAPI"]
+                )
+                {
+                }
+
+                over "stand" (
+                    prepend apiSchemas = ["IsaacLinkAPI"]
+                )
+                {
+                    over "stand_base_col" (
+                        prepend apiSchemas = ["IsaacLinkAPI"]
+                    )
+                    {
+                        over "stand_body_upper" (
+                            prepend apiSchemas = ["IsaacLinkAPI"]
+                        )
+                        {
+                            over "stand_body_shoulder" (
+                                prepend apiSchemas = ["IsaacLinkAPI"]
+                            )
+                            {
+                            }
+                        }
+                    }
+
+                    over "stand_left_arm_base" (
+                        prepend apiSchemas = ["IsaacSiteAPI"]
+                    )
+                    {
+                    }
+
+                    over "stand_right_arm_base" (
+                        prepend apiSchemas = ["IsaacSiteAPI"]
+                    )
+                    {
+                    }
+                }
+            }
+        }
+    }
+
+    over "Physics"
+    {
+        over "base_site_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "stand_fixed" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "stand_base_col_fixed" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "stand_body_upper_fixed" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "stand_body_shoulder_fixed" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+    }
+}
+

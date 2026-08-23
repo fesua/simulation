@@ -1,0 +1,7 @@
+.venv/
+.venv-isaac/
+outputs/
+physics/
+__pycache__/
+*.pyc
+nohup.out

@@ -1,0 +1,52 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "rb3_730e"
+    doc = """Generated from Composed Stage of root layer /tmp/tmptjlnoix9/rb3_730e.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_rb3_730e_l32ufiwr/usdex_rb3_730e/rb3_730e.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_rb3_730e_l32ufiwr/temp_rb3_730e/rb3_730e.usd
+
+
+Generated from Composed Stage of root layer /home/plaif/workspace/simulation/assets/rb3_730e/payloads/base.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "rb3_730e" (
+    prepend references = @./payloads/base.usda@
+    variants = {
+        string Physics = "physx"
+    }
+    append variantSets = "Physics"
+)
+{
+    variantSet "Physics" = {
+        "mujoco" (
+            prepend payload = @./payloads/Physics/mujoco.usda@
+        ) {
+
+        }
+        "none" {
+
+        }
+        "physics" (
+            prepend payload = @./payloads/Physics/physics.usda@
+        ) {
+
+        }
+        "physx" (
+            prepend payload = @./payloads/Physics/physx.usda@
+        ) {
+
+        }
+    }
+}
+

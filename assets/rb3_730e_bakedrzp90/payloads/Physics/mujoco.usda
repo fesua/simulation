@@ -1,0 +1,418 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "rb3_730e_bakedrzp90"
+    doc = """Generated from Composed Stage of root layer /tmp/tmph23r3ley/rb3_730e_bakedrzp90.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_rb3_730e_bakedrzp90_gkgsqpuv/usdex_rb3_730e_bakedrzp90/rb3_730e_bakedrzp90.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_rb3_730e_bakedrzp90_gkgsqpuv/temp_rb3_730e_bakedrzp90/rb3_730e_bakedrzp90.usd
+
+
+Generated from Composed Stage of root layer /home/plaif/workspace/simulation/assets/rb3_730e_bakedrzp90/payloads/base.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    subLayers = [
+        @./physics.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "rb3_730e_bakedrzp90"
+{
+    over "Physics"
+    {
+        def MjcActuator "base_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 150
+            uniform double mjc:forceRange:min = -150
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/base_joint>
+        }
+
+        def MjcActuator "shoulder_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 150
+            uniform double mjc:forceRange:min = -150
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/shoulder_joint>
+        }
+
+        def MjcActuator "elbow_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 150
+            uniform double mjc:forceRange:min = -150
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/elbow_joint>
+        }
+
+        def MjcActuator "wrist1_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 150
+            uniform double mjc:forceRange:min = -150
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/wrist1_joint>
+        }
+
+        def MjcActuator "wrist2_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 28
+            uniform double mjc:forceRange:min = -28
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/wrist2_joint>
+        }
+
+        def MjcActuator "wrist3_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 28
+            uniform double mjc:forceRange:min = -28
+            custom rel mjc:target
+            prepend rel mjc:target = </rb3_730e_bakedrzp90/Physics/wrist3_joint>
+        }
+
+        over "attachment_site_joint"
+        {
+        }
+
+        over "tool_joint"
+        {
+        }
+
+        over "tcp_joint"
+        {
+        }
+
+        over "link0_fixed"
+        {
+        }
+
+        over "base_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "shoulder_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "elbow_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wrist1_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wrist2_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wrist3_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+    }
+
+    over "Geometry"
+    {
+        over "world"
+        {
+            over "link0"
+            {
+                over "link1"
+                {
+                    over "link2"
+                    {
+                        over "link3"
+                        {
+                            over "link4"
+                            {
+                                over "link5"
+                                {
+                                    over "link6"
+                                    {
+                                        over "attachment_site"
+                                        {
+                                            over "tool"
+                                            {
+                                                over "pika_gripper_rzp90"
+                                                {
+                                                }
+
+                                                over "pika_gripper_hull_rzp90"
+                                                {
+                                                }
+                                            }
+
+                                            over "tcp"
+                                            {
+                                                over "sphere"
+                                                {
+                                                }
+                                            }
+
+                                            over "sphere"
+                                            {
+                                            }
+
+                                            over "ft_sensor_base"
+                                            {
+                                                over "ft_sensor_measurement"
+                                                {
+                                                }
+                                            }
+                                        }
+
+                                        over "link6_0"
+                                        {
+                                        }
+
+                                        over "link6_1"
+                                        {
+                                        }
+
+                                        over "link6_2"
+                                        {
+                                        }
+
+                                        over "link6_3"
+                                        {
+                                        }
+
+                                        over "link6_4"
+                                        {
+                                        }
+
+                                        over "link6_5"
+                                        {
+                                        }
+
+                                        over "link6_6"
+                                        {
+                                        }
+
+                                        over "link6"
+                                        {
+                                        }
+                                    }
+
+                                    over "link5_0"
+                                    {
+                                    }
+
+                                    over "link5_1"
+                                    {
+                                    }
+
+                                    over "link5_2"
+                                    {
+                                    }
+
+                                    over "link5_3"
+                                    {
+                                    }
+
+                                    over "link5"
+                                    {
+                                    }
+                                }
+
+                                over "link4_0"
+                                {
+                                }
+
+                                over "link4_1"
+                                {
+                                }
+
+                                over "link4_2"
+                                {
+                                }
+
+                                over "link4_3"
+                                {
+                                }
+
+                                over "link4_4"
+                                {
+                                }
+
+                                over "link4_hull_000"
+                                {
+                                }
+
+                                over "link4_hull_001"
+                                {
+                                }
+
+                                over "link4_hull_002"
+                                {
+                                }
+
+                                over "link4_hull_003"
+                                {
+                                }
+                            }
+
+                            over "link3_0"
+                            {
+                            }
+
+                            over "link3_1"
+                            {
+                            }
+
+                            over "link3_2"
+                            {
+                            }
+
+                            over "link3_3"
+                            {
+                            }
+
+                            over "link3_4"
+                            {
+                            }
+
+                            over "link3_5"
+                            {
+                            }
+
+                            over "link3"
+                            {
+                            }
+                        }
+
+                        over "link2_0"
+                        {
+                        }
+
+                        over "link2_1"
+                        {
+                        }
+
+                        over "link2_2"
+                        {
+                        }
+
+                        over "link2_3"
+                        {
+                        }
+
+                        over "link2_4"
+                        {
+                        }
+
+                        over "link2_5"
+                        {
+                        }
+
+                        over "link2_6"
+                        {
+                        }
+
+                        over "link2_7"
+                        {
+                        }
+
+                        over "link2_8"
+                        {
+                        }
+
+                        over "link2_9"
+                        {
+                        }
+
+                        over "link2_10"
+                        {
+                        }
+
+                        over "link2_hull_000"
+                        {
+                        }
+
+                        over "link2_hull_001"
+                        {
+                        }
+
+                        over "link2_hull_002"
+                        {
+                        }
+                    }
+
+                    over "link1_0"
+                    {
+                    }
+
+                    over "link1_1"
+                    {
+                    }
+
+                    over "link1_2"
+                    {
+                    }
+
+                    over "link1_3"
+                    {
+                    }
+
+                    over "link1_4"
+                    {
+                    }
+
+                    over "link1"
+                    {
+                    }
+                }
+
+                over "link0_0"
+                {
+                }
+
+                over "link0_1"
+                {
+                }
+
+                over "link0_2"
+                {
+                }
+
+                over "link0_3"
+                {
+                }
+
+                over "link0_4"
+                {
+                }
+
+                over "link0"
+                {
+                }
+            }
+        }
+    }
+
+    over "Materials"
+    {
+    }
+
+    over "VisualMaterials"
+    {
+    }
+}
+

@@ -5,3 +5,7 @@ physics/
 __pycache__/
 *.pyc
 nohup.out
+episodes/
+episodes_v*/
+probe_*/
+*.log

@@ -95,6 +95,15 @@ GRIP_PROPRIO = os.environ.get("GRIP_PROPRIO", "command").lower()
 # leads the arm, compensating a jaw slower than the arm.
 GRIP_LEAD = {"left": int(os.environ.get("GRIP_LEAD_L", "0")),
              "right": int(os.environ.get("GRIP_LEAD_R", "0"))}
+# DEPLOY CONTRACT: the runner subtracts a close-bias from the commanded opening
+# (--gripper-close-bias-left/right, code defaults 2/6, operator runs use ~4). The 8/19
+# hardware logs show why it exists: the policy commands the BOLT'S WIDTH (right cmd p50 18.5%
+# vs stall width 19.6%) because the UMI hand held exactly that width -- so without the bias the
+# jaws sit at zero pinch force, and the measured +-3%/step command chatter breaks contact. The
+# sim never modelled it; under a force-capped drive that omission alone explains the transport
+# drops. 0/0 = the historical behaviour.
+GRIP_BIAS = {"left": float(os.environ.get("GRIP_BIAS_L", "0")),
+             "right": float(os.environ.get("GRIP_BIAS_R", "0"))}
 # Jaw transport delay, per arm, in ms. Hardware measures 105 (left) and 209 (right); this rig
 # has always had ~0 because the position drive is stiff. Without it a lead value tuned in sim
 # has the WRONG SIGN for the robot: sim's jaw leads the arm, hardware's trails it.
@@ -136,6 +145,15 @@ IK_LAMBDA = float(os.environ.get("IK_LAMBDA", "1e-4"))
 # z=1.71 m), fully clear of the table and the working arm -- and the active arm services BOTH
 # colours, placing each bolt into the box of its own colour.
 ORACLE_ARM = os.environ.get("ORACLE_ARM", "").lower() or None
+# RETURN-EPISODE COLLECTION. Demos are 8.2 s single-cycle recordings -- "place done, go back
+# for the next bolt" exists nowhere in them, and rollouts die after ~10 s exactly there. This
+# mode generates that missing bridge: both arms START at a jittered place pose over their own
+# boxes (jaws open, the demonstrated RX tilt) and SEQUENTIALLY return to a hover over an
+# isolated bolt at the demo approach-entry state. Speeds are capped inside the demo action
+# distribution (pos p90 6.4 mm/step, rot p99 1.5 deg/step). Recording rides the existing
+# EVAL_PROBE_DUMP path; scripts/return_probe_to_hdf5.py converts dumps to per-episode HDF5.
+ORACLE_RETURN = os.environ.get("ORACLE_RETURN") == "1"
+_RET_Q = {}   # per-episode teleported start joints (filled at reset, consumed at q_cmd init)
 ORACLE_PARKED = ({"left": "right", "right": "left"}[ORACLE_ARM] if ORACLE_ARM else None)
 DIAG = os.environ.get("TREMOR_DIAG") == "1"
 # EVAL_DUMP_OBS=<dir> writes the exact wrist frames handed to the policy, every 30th tick.
@@ -180,18 +198,33 @@ def rotvec_to_mat(r):
 
 
 def mat_to_rotvec(R):
-    c = (np.trace(R) - 1.0) / 2.0
-    c = float(np.clip(c, -1.0, 1.0))
-    th = math.acos(c)
-    if th < 1e-9:
+    # Quaternion route. The direct formula divides by sin(theta), which near pi amplified
+    # numerical noise into INVALID rotvecs (|r| up to 4.33 > pi) in the per-tick dumps --
+    # tool-down attitudes sit exactly at that singularity, and the 1e-6 special-case band was
+    # far too narrow. Quaternion extraction is stable over the whole range.
+    t = float(np.trace(R))
+    if t > 0.0:
+        s_ = math.sqrt(t + 1.0) * 2.0
+        w = 0.25 * s_
+        x = (R[2, 1] - R[1, 2]) / s_
+        y = (R[0, 2] - R[2, 0]) / s_
+        z = (R[1, 0] - R[0, 1]) / s_
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s_ = math.sqrt(max(1e-12, 1.0 + R[i, i] - R[j, j] - R[k, k])) * 2.0
+        q = [0.0, 0.0, 0.0]
+        q[i] = 0.25 * s_
+        q[j] = (R[j, i] + R[i, j]) / s_
+        q[k] = (R[k, i] + R[i, k]) / s_
+        w = (R[k, j] - R[j, k]) / s_
+        x, y, z = q
+    n = math.sqrt(x * x + y * y + z * z)
+    if n < 1e-12:
         return np.zeros(3)
-    if abs(math.pi - th) < 1e-6:
-        # near-pi: use the symmetric part
-        w, V = np.linalg.eigh((R + np.eye(3)) / 2.0)
-        axis = V[:, int(np.argmax(w))]
-        return axis * th
-    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    return v * (th / (2.0 * math.sin(th)))
+    th = 2.0 * math.atan2(n, abs(w))
+    sign = 1.0 if w >= 0.0 else -1.0
+    return np.array([x, y, z]) * (sign * th / n)
 
 
 def quat_to_mat(q):
@@ -790,6 +823,9 @@ def main() -> int:
             self.claimed = set()
             self.clock = 0
             self.cooldown = {}          # bolt idx -> clock tick until which it is skipped
+            # return-mode state: sequential arms, constant open jaws, demo-speed caps
+            self.ret = {"order": None, "phase": {"left": "wait", "right": "wait"},
+                        "start": {}, "goal": {}, "grip0": {}, "timer": {"left": 0, "right": 0}}
 
         def _go(self, side, ph, timer=0):
             if self.DEBUG:
@@ -877,6 +913,9 @@ def main() -> int:
 
         def plan(self, side, anchor, B, placed):
             """-> (goal pose (6,), grip pct). Called once per chunk boundary."""
+            if ORACLE_RETURN:
+                self.clock += 1
+                return self.plan_return(side, anchor, B)
             self.age[side] += CHUNK_EXECUTE_STEPS
             self.clock += CHUNK_EXECUTE_STEPS
             stuck = self.age[side] > self.PHASE_TIMEOUT
@@ -970,6 +1009,53 @@ def main() -> int:
             col_ = self.place_col[side]
             return self._pose(np.array([self.PLACE_X, BOX_CY[col_], self.H_LIFT]), 0.0, side, place=True), self.OPEN
 
+        def plan_return(self, side, anchor, B):
+            r = self.ret
+            if r["order"] is None:
+                rng_ = np.random.default_rng(int(abs(B.sum()) * 1e6) % (2**31))
+                r["order"] = ["left", "right"] if rng_.random() < 0.5 else ["right", "left"]
+                for s2 in ("left", "right"):
+                    r["grip0"][s2] = float(rng_.uniform(60.0, 100.0))
+            if side not in r["start"]:
+                r["start"][side] = anchor.copy()
+                # v2 (operator, from the v1 mp4 review): v1 yawed toward a chosen bolt before
+                # any bolt was even in view -- rotation the demos never show at this stage. The
+                # return is now TRANSLATION ONLY: same attitude as the start (the slight place
+                # tilt stays), same height (no descent), moving to the vicinity of the RESET
+                # pose where picking normally begins. No bolt targeting, no rotation at all.
+                rng_g = np.random.default_rng(int(abs(B.sum()) * 1e6 + (0 if side == "left" else 7)) % (2**31))
+                rp = np.deg2rad(np.array(RESET[side], dtype=float))
+                p_r, _, _, _ = fk_chain(rp, T_mount[side])
+                gx = p_r[0] + rng_g.uniform(-0.03, 0.03)
+                gy = p_r[1] + rng_g.uniform(-0.03, 0.03)
+                r["goal"][side] = np.concatenate([[gx, gy, anchor[2]], anchor[3:]])
+            first, second = r["order"]
+            active = first if r["phase"][first] != "done" else second
+            g = r["grip0"][side]
+            if side != active:
+                # The idle arm HOLDS -- but a human hold is not a machine hold: the demos'
+                # idle arm drifts ~1.4 mm/step. A perfectly frozen pose would hand the model
+                # a "this is sim" cue (and an idle-arm distribution it has never seen), so the
+                # hold breathes: a smooth deterministic wander of ~2 mm amplitude.
+                base = (r["goal"][side] if r["phase"][side] == "done"
+                        else r["start"][side]).copy()
+                ph = 0.0 if side == "left" else 1.7
+                c = self.clock * CHUNK_EXECUTE_STEPS if False else self.clock
+                base[0] += 0.002 * np.sin(0.11 * c + ph)
+                base[1] += 0.002 * np.sin(0.07 * c + 2.1 + ph)
+                base[2] += 0.001 * np.sin(0.13 * c + 0.8 + ph)
+                return base, g
+            goal = r["goal"][side].copy()
+            lat = float(np.linalg.norm(anchor[:2] - goal[:2]))
+            dz_ = abs(anchor[2] - goal[2])
+            # v2: goal height == start height, so no transit clamp is needed; the whole
+            # path stays above the walls by construction.
+            if lat < 0.012 and dz_ < 0.020:
+                r["timer"][side] += CHUNK_EXECUTE_STEPS
+                if r["timer"][side] > 20:                       # 0.7 s settled hover
+                    r["phase"][side] = "done"
+            return goal.copy(), g
+
         def chunk(self, side, anchor, B, placed):
             """Absolute goal -> H rows of the sequential body-frame deltas the loop integrates."""
             goal, grip = self.plan(side, anchor, B, placed)
@@ -986,18 +1072,34 @@ def main() -> int:
                 # advances, and the next chunk reproduces the same zeros. That deadlock froze
                 # three oracle runs at 17-29 mm lateral error, always below the 4 x 10 mm the
                 # skipped rows could have covered. A geometric approach never emits zeros.
-                step = np.clip(self.GAIN * d, -lim, lim)
+                if ORACLE_RETURN:
+                    # NORM cap, not per-axis: axis clipping lets diagonals reach 8.7 mm/step,
+                    # already past the demo p90. 5 mm on the vector keeps every step inside.
+                    step = self.GAIN * d
+                    n_s = float(np.linalg.norm(step))
+                    if n_s > 0.005:
+                        step = step * (0.005 / n_s)
+                else:
+                    step = np.clip(self.GAIN * d, -lim, lim)
                 nxt_p = cur_p + step
                 # slew the attitude a fixed fraction per tick so it arrives with the position
                 dR = cur_R.T @ R_goal
                 rv = mat_to_rotvec(dR)
-                nxt_R = cur_R @ rotvec_to_mat(rv * 0.25)
+                if ORACLE_RETURN:
+                    n_ = np.linalg.norm(rv)
+                    rv_step = rv * min(1.0, np.radians(1.0) / max(n_, 1e-9))
+                    nxt_R = cur_R @ rotvec_to_mat(rv_step)
+                else:
+                    nxt_R = cur_R @ rotvec_to_mat(rv * 0.25)
                 # invert the loop's composition: p += R_cur @ (R_ALIGN @ dp)
                 rows[k, :3] = R_ALIGN.T @ (cur_R.T @ (nxt_p - cur_p))
                 rows[k, 3:6] = R_ALIGN.T @ mat_to_rotvec(cur_R.T @ nxt_R)
                 # rows 4..7 are what actually executes, so the ramp has to live in the rows.
-                rows[k, 6] = max(0.0, min(1.0, (grip - self.GRIP_RATE * k) / 100.0)) \
-                    if grip < self.OPEN else grip / 100.0
+                if ORACLE_RETURN:
+                    rows[k, 6] = grip / 100.0          # constant open hold, no ramp
+                else:
+                    rows[k, 6] = max(0.0, min(1.0, (grip - self.GRIP_RATE * k) / 100.0)) \
+                        if grip < self.OPEN else grip / 100.0
                 cur_p, cur_R = nxt_p, nxt_R
             return rows
 
@@ -1043,6 +1145,36 @@ def main() -> int:
                 q[names.index(j)] = np.deg2rad(deg)
             if side == ORACLE_PARKED:
                 q[:] = 0.0                     # straight up, out of the working volume
+            if ORACLE_RETURN:
+                # Teleport to a jittered own-box place pose: offline DLS from the reset q --
+                # pure kinematics, no physics stepping, so it cannot disturb the settled scene.
+                rng_ = np.random.default_rng(ep_seed * 7 + (0 if side == "left" else 1))
+                col_ = "gray" if side == "left" else "black"
+                tgt_p = np.array([0.66 + rng_.uniform(-0.02, 0.02),
+                                  BOX_CY[col_] + rng_.uniform(-0.02, 0.02),
+                                  0.20 + rng_.uniform(-0.03, 0.03)])
+                # operator: the start is a SLIGHTLY tilted post-place pose (padDCp t=11 s),
+                # not the full 25-deg place tilt -- the full tilt held during the return put
+                # the right arm's IK at its limits and it ran away (joint-limit clamp drift).
+                zt = np.array([0.15 + rng_.uniform(-0.07, 0.07), rng_.uniform(-0.05, 0.05), -0.99])
+                zt /= np.linalg.norm(zt)
+                xt = np.cross([0.0, 0.0, 1.0], [np.cos(rng_.uniform(0, np.pi)),
+                                                np.sin(rng_.uniform(0, np.pi)), 0.0])
+                xt -= np.dot(xt, zt) * zt; xt /= np.linalg.norm(xt)
+                R_t = np.column_stack([xt, np.cross(zt, xt), zt])
+                qq = np.deg2rad(np.array(RESET[side], dtype=float))
+                for _ in range(400):
+                    p_f, R_f, _, _ = fk_chain(qq, T_mount[side])
+                    err = np.concatenate([tgt_p - p_f,
+                                          mat_to_rotvec(R_t @ R_f.T)])
+                    if np.linalg.norm(err[:3]) < 5e-4 and np.linalg.norm(err[3:]) < 2e-3:
+                        break
+                    J = jacobian(qq, T_mount[side])
+                    dq_ = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err)
+                    qq = np.clip(qq + np.clip(dq_, -0.05, 0.05), JOINT_LO, JOINT_HI)
+                for j, val in zip(ARM_JOINTS, qq):
+                    q[names.index(j)] = val
+                _RET_Q[side] = qq.copy()   # q_cmd does not exist yet at this point
             art.set_joint_positions(q)
             art.set_joint_velocities(np.zeros_like(q))
             # kp=1e7 at a 2 ms step is extremely stiff; expose it so the tremor can be
@@ -1107,6 +1239,21 @@ def main() -> int:
         # T1 scene difficulty is a property of the CONDITION, so measure it on the settled
         # START scene. Measuring after the episode (as this first did) let the arms disturb the
         # pile, and the same seed reported different crowding in two runs.
+        if ORACLE_RETURN:
+            # Mid-task scene: k bolts per colour already sit in their boxes, as they would
+            # after the first cycle(s). Settled first, then moved, then a short re-settle.
+            rng_pp = np.random.default_rng(ep_seed * 13)
+            for col_, side_ in (("gray", +1), ("black", -1)):
+                k = int(rng_pp.integers(0, 3))
+                idx = [i for i, c in enumerate(colors) if c == col_][:k]
+                for j, i2 in enumerate(idx):
+                    bolt_views[bolt_prims[i2]].set_world_poses(
+                        positions=np.array([[0.66 + 0.04 * j,
+                                             BOX_CY[col_] + rng_pp.uniform(-0.06, 0.06),
+                                             0.05]]),
+                        orientations=np.array([[1.0, 0.0, 0.0, 0.0]]))
+            for _ in range(120):
+                world.step(render=False)
         B0 = bolt_xyz()
         # A bolt that settles inside a box was never picked or placed -- it was born there.
         # Counting it inflated every arm's score (0.05/ep aligned, 0.40/ep random) and was
@@ -1147,8 +1294,11 @@ def main() -> int:
         # ---- follower + command state ---------------------------------------
         followers, cmd_hist, grip_cmd, q_cmd = {}, {}, {}, {}
         for side in MOUNT_FRAME:
-            q_cmd[side] = (np.zeros(6) if side == ORACLE_PARKED
-                           else np.deg2rad(np.array(RESET[side], dtype=float)))
+            if ORACLE_RETURN and side in _RET_Q:
+                q_cmd[side] = _RET_Q[side].copy()
+            else:
+                q_cmd[side] = (np.zeros(6) if side == ORACLE_PARKED
+                               else np.deg2rad(np.array(RESET[side], dtype=float)))
             p_fk, R_fk, _, _ = fk_chain(q_cmd[side], T_mount[side])
             p_ph, _ = tcp_pose(side)
             d = float(np.linalg.norm(p_fk - p_ph))
@@ -1396,7 +1546,8 @@ def main() -> int:
                 # This is an EXECUTION fix, not a training one: the data contains no latency to
                 # learn from.
                 gi = int(np.clip(chunk_idx + GRIP_LEAD[side], 0, chunk[side].shape[0] - 1))
-                grip_cmd[side] = float(np.clip(chunk[side][gi][6] * 100.0, 0.0, 100.0))
+                grip_cmd[side] = float(np.clip(
+                    chunk[side][gi][6] * 100.0 - GRIP_BIAS[side], 0.0, 100.0))
                 grip_hist[side].append(grip_cmd[side])
                 # ---- T1: which bolt is this arm's 24-step-ahead intent pointing at? ----
                 # knots[-1] is the far end of the integrated chunk, i.e. the policy's stated

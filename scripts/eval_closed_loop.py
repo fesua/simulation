@@ -109,6 +109,42 @@ GRIP_BIAS = {"left": float(os.environ.get("GRIP_BIAS_L", "0")),
 # has the WRONG SIGN for the robot: sim's jaw leads the arm, hardware's trails it.
 GRIP_LAG_MS = {"left": float(os.environ.get("GRIP_LAG_L", "0")),
                "right": float(os.environ.get("GRIP_LAG_R", "0"))}
+GRIP_FLOOR = float(os.environ.get("GRIP_FLOOR", "0"))
+# Interface-experiment modes (2026-08-24). STATE_MODE=posegrip feeds reset-relative pose state
+# (converter `_rel`: pose in the episode-start command frame) instead of 1-step velocity;
+# ACTION_MODE=anchored interprets chunk rows as UMI t0-relative waypoints (PikaUmiInputs
+# `_anchor_relative_chunk` inverse) instead of chained per-step deltas. Frame mapping to the
+# sim's TCP frame is the R_ALIGN conjugation, which for both 3-vectors is the same linear
+# R_ALIGN multiply used for deltas.
+STATE_MODE = os.environ.get("STATE_MODE", "velocity").lower()
+ACTION_MODE = os.environ.get("ACTION_MODE", "delta").lower()
+# rtc_raw_actions is MODEL-SPACE (normalized). The anchored RTC re-anchor is SE(3) algebra,
+# which is invalid on normalized values (real-robot 20260825: normalized rotvec -> garbage
+# rotation -> 30-50 mm chunk-boundary jumps, base-ward drift; the sim ran the same bad math
+# with milder symptoms -- likely part of anchored's 3x tremor). Unnormalize with the served
+# checkpoint's action q01/q99, transform, renormalize. RTC_NORM_STATS overrides the default.
+RTC_NORM_STATS = os.environ.get("RTC_NORM_STATS") or (
+    os.path.expanduser("~/workspace/openpi_runs/assets/pi05_pika_umi_wrist_anchored_velgrip_k1"
+                       "_h24_40k/plaif/pika_umi_video_train_tcp_anchored_velgrip_k1/norm_stats.json")
+    if ACTION_MODE == "anchored" else "")
+_RTC_NORM_Q = None
+if ACTION_MODE == "anchored" and RTC_NORM_STATS and os.path.exists(RTC_NORM_STATS):
+    import json as _json_ns
+    _a_ns = _json_ns.load(open(RTC_NORM_STATS))["norm_stats"]["actions"]
+    _RTC_NORM_Q = (np.asarray(_a_ns["q01"], dtype=np.float64)[:14],
+                   np.asarray(_a_ns["q99"], dtype=np.float64)[:14])
+    print(f"[eval] anchored RTC norm stats loaded: {RTC_NORM_STATS}")
+elif ACTION_MODE == "anchored":
+    print("[eval] WARNING: ACTION_MODE=anchored but no RTC_NORM_STATS found -> "
+          "RTC prev-chunk conditioning will be DISABLED (vanilla sampling)")
+
+
+def _rtc_unnorm(n, q01, q99):
+    return (np.asarray(n, dtype=np.float64) + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+
+
+def _rtc_renorm(x, q01, q99):
+    return ((x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0).astype(np.float32)
 # ee_local r_align: pika_rz180 = diag(-1,-1,+1), applied to BOTH linear and angular
 R_ALIGN = np.diag([-1.0, -1.0, 1.0])
 
@@ -1158,8 +1194,13 @@ def main() -> int:
                 # the right arm's IK at its limits and it ran away (joint-limit clamp drift).
                 zt = np.array([0.15 + rng_.uniform(-0.07, 0.07), rng_.uniform(-0.05, 0.05), -0.99])
                 zt /= np.linalg.norm(zt)
-                xt = np.cross([0.0, 0.0, 1.0], [np.cos(rng_.uniform(0, np.pi)),
-                                                np.sin(rng_.uniform(0, np.pi)), 0.0])
+                # Jaw yaw from the MEASURED post-place distribution, not uniform(0, pi): padDC
+                # rollouts hovering open over the box sit at +79 deg +-5 (left) / +96 deg +-5
+                # (right) world jaw angle -- a tight band, folded onto the reset pose's own jaw
+                # direction. Random start yaws put the wrist somewhere the policy never is
+                # after placing (operator, from the v3 preview review).
+                psi = np.radians((79.0 if side == "left" else 96.0) + rng_.uniform(-6.0, 6.0))
+                xt = np.array([np.cos(psi), np.sin(psi), 0.0])
                 xt -= np.dot(xt, zt) * zt; xt /= np.linalg.norm(xt)
                 R_t = np.column_stack([xt, np.cross(zt, xt), zt])
                 qq = np.deg2rad(np.array(RESET[side], dtype=float))
@@ -1314,6 +1355,10 @@ def main() -> int:
         n_ticks = int(args.episode_sec / POLICY_DT)
         chunk = {s: None for s in MOUNT_FRAME}
         grip_hist = {s: [] for s in MOUNT_FRAME}     # commanded grip per policy tick
+        ep_start_pose = {}
+        for s_ in ("left", "right"):
+            p0_, R0_, _, _ = fk_chain(q_cmd[s_], T_mount[s_])
+            ep_start_pose[s_] = (p0_.copy(), R0_.copy())
         if oracle is not None:
             oracle.__init__()                 # planner state is per-episode
         chunk_idx = 0
@@ -1366,8 +1411,16 @@ def main() -> int:
                 R_cur, R_next = rotvec_to_mat(h[-2][3:]), rotvec_to_mat(h[-1][3:])
                 pos_vel = R_cur.T @ (p_next - p_cur)
                 rot_vel = mat_to_rotvec(R_cur.T @ R_next)
-                state[bi * 7 + 0: bi * 7 + 3] = R_ALIGN @ pos_vel
-                state[bi * 7 + 3: bi * 7 + 6] = R_ALIGN @ rot_vel
+                if STATE_MODE == "posegrip":
+                    # reset-relative pose in the episode-start COMMAND frame (deploy contract
+                    # is command-sourced proprio), mapped to the tip frame via R_ALIGN.
+                    p0_, R0_ = ep_start_pose[side]
+                    pc_, Rc_, _, _ = fk_chain(q_cmd[side], T_mount[side])
+                    state[bi * 7 + 0: bi * 7 + 3] = R_ALIGN @ (R0_.T @ (pc_ - p0_))
+                    state[bi * 7 + 3: bi * 7 + 6] = R_ALIGN @ mat_to_rotvec(R0_.T @ Rc_)
+                else:
+                    state[bi * 7 + 0: bi * 7 + 3] = R_ALIGN @ pos_vel
+                    state[bi * 7 + 3: bi * 7 + 6] = R_ALIGN @ rot_vel
                 # GRIPPER PROPRIO SOURCE. The deployed runner defaults to `actual` -- the
                 # MEASURED jaw, which lags its command by 105-209 ms on hardware. This rig has
                 # always sent the COMMAND, which has zero lag, so the grip channel the policy
@@ -1413,8 +1466,31 @@ def main() -> int:
                     # will have executed when the new chunk takes over, so the freeze pins
                     # to the UNEXECUTED tail rather than replaying old actions.
                     steps = int(max(0, min(CHUNK_EXECUTE_STEPS, rtc_prev_raw.shape[0])))
-                    pad = np.zeros((steps, rtc_prev_raw.shape[1]), dtype=rtc_prev_raw.dtype)
-                    obs["prev_action_chunk"] = np.concatenate([rtc_prev_raw[steps:], pad], axis=0)
+                    if ACTION_MODE == "anchored" and steps > 0 and _RTC_NORM_Q is None:
+                        pass   # no valid re-anchor possible: vanilla beats a corrupted freeze
+                    elif ACTION_MODE == "anchored" and steps > 0:
+                        # anchored rows are transforms rel the OLD chunk anchor; the freeze must
+                        # pin rows re-expressed rel the row that will be the NEW anchor state:
+                        # T'_k = T_s^-1 T_{k+s}, per arm -- computed in UNNORMALIZED space
+                        # (rtc_prev_raw is normalized model space; see RTC_NORM_STATS above).
+                        q01_, q99_ = _RTC_NORM_Q
+                        un_ = _rtc_unnorm(rtc_prev_raw[:, :14], q01_, q99_)
+                        shifted_un = un_[steps:].copy()
+                        for b in (0, 7):
+                            ps_ = un_[steps - 1, b:b+3]
+                            Rs_ = rotvec_to_mat(un_[steps - 1, b+3:b+6])
+                            for k_ in range(shifted_un.shape[0]):
+                                pk_ = un_[steps + k_, b:b+3]
+                                Rk_ = rotvec_to_mat(un_[steps + k_, b+3:b+6])
+                                shifted_un[k_, b:b+3] = Rs_.T @ (pk_ - ps_)
+                                shifted_un[k_, b+3:b+6] = mat_to_rotvec(Rs_.T @ Rk_)
+                        shifted = rtc_prev_raw[steps:].copy()
+                        shifted[:, :14] = _rtc_renorm(shifted_un, q01_, q99_)
+                        pad = np.zeros((steps, rtc_prev_raw.shape[1]), dtype=rtc_prev_raw.dtype)
+                        obs["prev_action_chunk"] = np.concatenate([shifted, pad], axis=0)
+                    else:
+                        pad = np.zeros((steps, rtc_prev_raw.shape[1]), dtype=rtc_prev_raw.dtype)
+                        obs["prev_action_chunk"] = np.concatenate([rtc_prev_raw[steps:], pad], axis=0)
                     obs["inference_delay"] = int(np.clip(RTC_INFERENCE_DELAY, 0,
                                                          CHUNK_EXECUTE_STEPS))
                 return obs
@@ -1496,6 +1572,26 @@ def main() -> int:
                     # look ahead; knots[0] is the anchor itself.
                     ks = [anchor_pose.copy()]
                     cur_p, cur_R = anchor_pose[:3].copy(), rotvec_to_mat(anchor_pose[3:])
+                    if ACTION_MODE == "anchored":
+                        # each row composes INDEPENDENTLY onto the anchor -- no chaining, no
+                        # within-chunk integration drift. Spacing between consecutive knots is
+                        # still clamped so the follower never receives an infeasible jump.
+                        pa, Ra = anchor_pose[:3], rotvec_to_mat(anchor_pose[3:])
+                        prev = anchor_pose.copy()
+                        for r in chunk[side]:
+                            dl = R_ALIGN @ (np.asarray(r[:3]) * SPEED_SCALE)
+                            da = R_ALIGN @ (np.asarray(r[3:6]) * SPEED_SCALE)
+                            tp = pa + Ra @ dl
+                            tR = Ra @ rotvec_to_mat(da)
+                            step = tp - prev[:3]
+                            nl = np.linalg.norm(step)
+                            if nl > LIN_V * POLICY_DT:
+                                tp = prev[:3] + step * (LIN_V * POLICY_DT / nl)
+                            k_ = np.concatenate([tp, mat_to_rotvec(tR)])
+                            ks.append(k_)
+                            prev = k_
+                        knots[side] = ks
+                        continue
                     for r in chunk[side]:
                         dl = R_ALIGN @ r[:3] * SPEED_SCALE
                         da = R_ALIGN @ r[3:6] * SPEED_SCALE
@@ -1548,6 +1644,19 @@ def main() -> int:
                 gi = int(np.clip(chunk_idx + GRIP_LEAD[side], 0, chunk[side].shape[0] - 1))
                 grip_cmd[side] = float(np.clip(
                     chunk[side][gi][6] * 100.0 - GRIP_BIAS[side], 0.0, 100.0))
+                # PRIVILEGED capture-funnel probe (GRIP_FLOOR, sim-only). Mined verdict: 84% of
+                # contact entries arrive with the jaw already narrowed to <35% (capture margin
+                # +-0-4 mm vs 15-18 mm aim scatter) and convert at 5-10%; the 16% that arrive
+                # >=35% open convert at 55%. This gate forces the jaw open while still ABOVE
+                # the nearest bolt, to causally test that premature narrowing -- not aim, not
+                # depth -- is the pick bottleneck. Uses ground-truth bolt height, so it is an
+                # instrument, not a deployable fix.
+                if GRIP_FLOOR > 0.0:
+                    p_gf, _ = tcp_pose(side)
+                    if p_gf[0] < 0.56 and _bxy is not None:
+                        j_gf = int(np.argmin(np.linalg.norm(_bxy[:, :2] - p_gf[:2], axis=1)))
+                        if (p_gf[2] - _bxy[j_gf][2]) > 0.020:
+                            grip_cmd[side] = max(grip_cmd[side], GRIP_FLOOR)
                 grip_hist[side].append(grip_cmd[side])
                 # ---- T1: which bolt is this arm's 24-step-ahead intent pointing at? ----
                 # knots[-1] is the far end of the integrated chunk, i.e. the policy's stated

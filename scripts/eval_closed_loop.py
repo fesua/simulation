@@ -196,6 +196,11 @@ DIAG = os.environ.get("TREMOR_DIAG") == "1"
 # The observation path is the one thing an aggregate score cannot audit -- black or stale
 # frames score 0 while looking like a policy result (see CLAUDE.md section 20).
 DUMP_OBS = os.environ.get("EVAL_DUMP_OBS") or ""
+# OBS_PREV_FRAMES=1 attaches the wrist frames from OBS_PREV_DELTA policy ticks ago as
+# observation/{left,right}_wrist_prev_rgb (obs-2 models). History holds only frames grabbed at
+# replan boundaries, so the match is nearest-tick, not exact -- error <= half the replan interval.
+OBS_PREV = os.environ.get("OBS_PREV_FRAMES") == "1"
+OBS_PREV_DELTA = int(os.environ.get("OBS_PREV_DELTA", "8"))
 if DUMP_OBS:
     os.makedirs(DUMP_OBS, exist_ok=True)
 # EVAL_PROBE_DUMP=<dir> writes a PERCEPTION-PROBE dataset: every PROBE_EVERY-th policy tick,
@@ -1393,6 +1398,7 @@ def main() -> int:
         blank_obs = {s_: 0 for s_ in MOUNT_FRAME}   # empty wrist frames fed to the policy
         rtc_warned = False
         infer_ms = []
+        _prev_frames = []   # (tick, imgs) at each _observe; obs-2 support
 
         for tick in range(n_ticks):
             # ---- observation (velproprio_source=command, fixed_step) ---------
@@ -1461,6 +1467,14 @@ def main() -> int:
                     "observation/state": state,
                     "prompt": PROMPT,
                 }
+                if OBS_PREV:
+                    tgt = tick - OBS_PREV_DELTA
+                    pimgs = (min(_prev_frames, key=lambda e_: abs(e_[0] - tgt))[1]
+                             if _prev_frames else imgs)
+                    obs["observation/left_wrist_prev_rgb"] = pimgs["left"]
+                    obs["observation/right_wrist_prev_rgb"] = pimgs["right"]
+                    _prev_frames.append((tick, imgs))
+                    del _prev_frames[:-12]
                 if RTC_ENABLED and rtc_prev_raw is not None:
                     # rtc_shift_prev_chunk: advance the cached raw chunk by the steps that
                     # will have executed when the new chunk takes over, so the freeze pins

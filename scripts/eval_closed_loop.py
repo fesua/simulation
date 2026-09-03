@@ -150,8 +150,114 @@ def _rtc_renorm(x, q01, q99):
 R_ALIGN = np.diag([-1.0, -1.0, 1.0])
 
 # ---- Ruckig follower limits (stack_real.yaml: safety.ruckig_follower) -------
-LIN_V, LIN_A, LIN_J = 0.45, 12.0, 4000.0
-ANG_V, ANG_A, ANG_J = 0.90, 40.0, 8000.0
+LIN_V, LIN_A = 0.45, 12.0
+ANG_V, ANG_A = 0.90, 40.0
+LIN_J = float(os.environ.get("LIN_JERK", "2000.0"))
+ANG_J = float(os.environ.get("ANG_JERK", "4000.0"))
+# JERK: 4000/8000 -> 2000/4000 on 2026-09-03, to follow stack_real.yaml. The robot halved this
+# pair on 2026-08-28 "to soften the acceleration transients that excite the arm's 11-13 Hz
+# mode": at dt 2 ms, 4000 m/s^3 lets acceleration swing 8 m/s^2 in ONE tick, so the 12 m/s^2
+# ceiling is reachable in ~3 ms -- near-step acceleration, broadband, straight into that mode.
+# Their measurement: Ruckig used only 58% of the jerk limit at p50 while acceleration ran at
+# 45% p50 and touched the ceiling, and vibration correlated with acceleration (+0.61) more than
+# with jerk (+0.42). The feasibility cost was checked on their own knot stream and is small
+# (conv 93.1% -> 90.0% left, 95.4% -> 92.7% right). The accels 12/40 are NOT halved.
+# NOTE the reference config is the RB3-730E one (fad2cd4^): stack_real.yaml and stack_sim.yaml
+# both switched to the RB5-850E on 2026-09-02 and their live values are for a different arm.
+# ORIENTATION REPRESENTATION IN THE FOLLOWER. `tangent` (default) mirrors
+# cartesian_chunk_follower.cpp: a quaternion base R0_ref plus a SMALL rotation vector in its
+# tangent, re-based at every knot (relinearizeAndReseed). `abs` is the historical rig
+# behaviour -- the ABSOLUTE rotvec straight into Ruckig axes 3-5.
+# Why this matters (measured 2026-09-03): the tool-down attitude this task uses sits at
+# |rotvec| = 3.05-3.14 rad, i.e. ON the pi boundary, and mat_to_rotvec canonicalises to w>=0.
+# Every crossing therefore flips the 3-vector to its antipode: the true rotation step between
+# knots is 0.34-0.64 deg while the RAW rotvec difference reaches 357-360 deg, 12-44 times per
+# 20 s episode. Ruckig interpolates its axes linearly, so each flip slews the reference the
+# wrong way at up to ANG_V and poisons the central-difference target velocity. Joint wiggle in
+# the 100 ms after a flip measured 1.9-2.6x the rest of the episode (5 of 6 arm-runs).
+# This is a REPRESENTATION BUG, not command smoothing -- the tangent form tracks the same
+# commanded orientation, it just stops the coordinates from jumping.
+FOLLOWER_ROT = os.environ.get("FOLLOWER_ROT", "tangent").lower()
+# RAINBOW CONTROL BOX TRANSPORT DELAY, in 2 ms servo ticks, applied to the JOINT command on
+# its way to the drives. This models the one stage the rig has never had: on hardware the
+# host streams move_servo_j into the box and the box replays it from a FIFO.
+# Measured on the deployed firmware (omx_wiki rainbow-control-box-servo-j-latency-fw-v8-7-3,
+# 334 s / 167,155 ticks, queue_sync target_fill 5, servo_alpha 10 = inner LPF OFF):
+#     box delay = RBACK queue fill + 1 tick, exactly, both arms, all joints. Nothing else.
+#     sent -> ref  8.17 / 8.03 tk (16.3 / 16.1 ms), a PURE DEAD TIME (residual 0.0001-0.003 deg)
+#     ref -> actual 2.97 / 3.09 tk        end to end 11.14 / 11.13 tk (22.3 ms)
+# So the box is a DELAY, not a filter -- `servo_t2_sec` is the controller hold time and is
+# explicitly "not UR-style lookahead" (docs/servo_backend_contract.md). Modelling it as a
+# blend would be command smoothing, which this rig forbids; modelling it as a delay is plant
+# fidelity. The remaining ref->actual ~3 tk is already supplied by the PhysX drive, whose
+# measured first-order lag is 7.7 ms (3.9 tk) against the box's 2.97-3.09 tk.
+# 0 = off (every result before 2026-09-03 ran this way); 8 = the measured sent->ref stage.
+BOX_DELAY_TICKS = int(os.environ.get("BOX_DELAY_TICKS", "0"))
+# HOW THE JOINT COMMAND REACHES THE ROBOT.
+#   drive     (default) PhysX position drive; q_actual is the dynamics solution and lags q_ref
+#             by a first-order 7.7 ms (= kd/kp), and adds a near-Nyquist ring at 176-236 Hz.
+#   kinematic the ARM joints are written straight into the articulation state every 2 ms, so
+#             q_actual == q_ref exactly and no arm dynamics are solved at all.
+# `kinematic` exists to settle one question and only one: is the visible shake made by the
+# dynamics solve, or is it already in the command? It is a DIAGNOSTIC, not an eval mode --
+# teleporting the arm means the links no longer push back on anything they touch, so grasping
+# and every contact number from such a run are meaningless. The FINGERS deliberately stay on
+# the drive so the jaw still stalls on a bolt instead of scything through it.
+DRIVE_MODE = os.environ.get("DRIVE_MODE", "drive").lower()
+# VELPROPRIO HISTORY vs CHUNK ANCHOR. This rig kept ONE list (`cmd_hist`) for two jobs: the
+# emitted-command history the policy's velocity proprio is differenced from, AND the slot the
+# chunk anchor is written into at every boundary. The anchor write therefore replaced the last
+# emitted knot with FK(q_cmd), so the tick after each boundary fed the policy
+# `knot - FK(q_cmd)` instead of `knot - knot`. Measured 2026-09-03: the injected error is
+# 14-32% of a typical per-tick displacement, once per chunk boundary -- 7.35 Hz at execute 4,
+# which is exactly where the measured command wiggle peaks (7.41 Hz).
+# The robot keeps them apart: openpi_remote._record_command_pose_history appends the emitted
+# TcpPoseTarget only (ZOH on hold ticks) and the velproprio takes a time-based one-step
+# lookback from THAT deque; the anchor never touches it.
+# 1 = the historical (shared) behaviour, for A/B. 0 = separated, matching the robot.
+VELPROPRIO_ANCHOR_OVERWRITE = os.environ.get("VELPROPRIO_ANCHOR_OVERWRITE", "0") == "1"
+# FOLLOWER OUTPUT SMD -- port of rb_servo_server/src/control/follower_output_smd.cpp, the one
+# stage of the deployed controller this rig never had. It sits between the follower's 500 Hz
+# emitted pose and the IK, runs continuously (no chunk-boundary state: a per-chunk FIR was
+# tried on hardware and made a 5.74 Hz boundary comb), and is a second-order critically damped
+# tracker with LOW-PASSED velocity feedforward. With zeta=1 and w_lpf=wn:
+#     H(s) = wn^2 (3s + wn) / (s + wn)^3
+# The feedforward cancels first-order lag, so it is NOT a plain low-pass: 0.5-3 Hz passes at
+# 1.06-1.30x and attenuation only starts above ~4.3 Hz. Hardware acceptance 2026-07-31
+# (offline replay of a recorded trembling knot stream): accel power attenuation 13-20 Hz
+# 89-109x, 10-13 Hz 22-31x, 5-10 Hz 4.5-5.1x, task band 1-5 Hz kept at 1.15x, path deviation
+# p50 0.42 / p95 3.5 / max 9.4 mm -> enabled on the robot ever since.
+# Defaults are stack_real.yaml's own (nf 3.5 / 2.5 Hz, zeta 1.0, ff on, ff_lpf 0 = follow nf).
+# OFF by default here so no historical eval number moves without being asked for.
+# ON by default since 2026-09-03: `output_smd.enable: true` on the robot, operator decision
+# to run the same controller here. OUTPUT_SMD=0 restores the pre-port rig for A/B.
+OUTPUT_SMD = os.environ.get("OUTPUT_SMD", "1") == "1"
+SMD_NF_LIN = float(os.environ.get("SMD_NF_LINEAR_HZ", "3.5"))
+SMD_NF_ANG = float(os.environ.get("SMD_NF_ANGULAR_HZ", "2.5"))
+SMD_ZETA = float(os.environ.get("SMD_DAMPING_RATIO", "1.0"))
+SMD_FF = os.environ.get("SMD_VELOCITY_FF", "1") == "1"
+SMD_FF_LPF = float(os.environ.get("SMD_VELOCITY_FF_LPF_HZ", "0"))
+# ACCELERATION FEEDFORWARD. cartesian_chunk_follower hands its BVP the central-difference
+# af of the flanking knots, damped by af_damping_beta_{lin,ang} (both 1.0 on the RB3 profile).
+# This rig passed NO target acceleration at all, i.e. af_target = 0 at every knot -- the exact
+# analogue of the target_velocity=0 bug fixed on 2026-08-18, one derivative up. stack_real.yaml
+# spells out why zero is not the safe default: "the cost of a segment is not |af|, it is
+# |af_target - a0| / dt -- the jerk needed to swing acceleration from the chained current state
+# to the target. a0 already carries the honest curvature, so shrinking af_target ENLARGES that
+# mismatch and spends jerk forcing the arm to arrive flatter than it is actually travelling.
+# af is a boundary condition, not a demand; a smaller one is not a cheaper one."
+AF_BETA_LIN = float(os.environ.get("AF_BETA_LIN", "1.0"))
+AF_BETA_ANG = float(os.environ.get("AF_BETA_ANG", "1.0"))
+# CORNER (direction-reversal) RING-DOWN GUARD, chunk_follower_core.hpp:276 --
+#     if sign(d_k) and sign(d_kp1) are both non-zero and DIFFER on an axis, vf[axis] *= scale
+# with a per-class deadband so a flanking step below it contributes sign 0 and cannot form a
+# reversal pair. Values are stack_real.yaml's (RB3 profile): 0.3 mm / 0.0005 rad / 0.25.
+# Ported 2026-09-03 on the operator's "match the deployed controller even at the cost of
+# success rate" decision. It is NOT a sim-side damping guard invented to hide tremor -- that
+# is what CLAUDE.md forbids -- it is a stage the robot runs on every segment.
+CORNER_SCALE = float(os.environ.get("CORNER_VELOCITY_SCALE", "0.25"))
+CORNER_DB_LIN = float(os.environ.get("CORNER_DEADBAND_LIN_M", "0.0003"))
+CORNER_DB_ANG = float(os.environ.get("CORNER_DEADBAND_ANG_RAD", "0.0005"))
 
 PHYSICS_DT = 1.0 / 500.0    # real servo rate
 # rb3_730e.urdf gives every arm joint velocity=3.14159 rad/s. Clipping the IK step
@@ -175,6 +281,32 @@ DQ_MAX = JOINT_VEL_LIMIT * PHYSICS_DT
 # Jacobian's smallest singular value drops to ~2e-4 and the arm visibly shakes and sheds bolts;
 # a heavier damping trades tracking for calm there, so it is a knob, not a new default.
 IK_LAMBDA = float(os.environ.get("IK_LAMBDA", "1e-4"))
+# IK: the robot's own solver, from the RB3-730E profile (fad2cd4^ stack_real.yaml `kinematics.ik`)
+#     damping 0.02  singular_region_eps 0.10  damping_max 0.08
+#     max_iterations 100  min_iterations 1  position_tolerance 20 um  orientation_tolerance 0.0002 rad
+#     max_step_deg [2,2,2,3,3,4]
+# pinocchio_kinematics.cpp does SELECTIVE, SVD-based damped least squares:
+#     dq = V diag(sigma / (sigma^2 + lambda_i^2)) U^T err
+#     lambda_i^2 = damping^2, plus damping_max^2 * (1 - (sigma/eps)^2) on directions with
+#                  sigma < eps
+# so the inverse gain is capped on the degenerate direction only, leaving well-conditioned
+# directions at full tracking accuracy. This rig instead used a UNIFORM lambda^2 = 1e-4 with no
+# ramp, i.e. 4x less damping at baseline and, in the singular region, up to 68x less
+# (0.02^2 + 0.08^2 = 6.8e-3 against 1e-4). Measured here 2026-09-03: sigma_min p10 is 0.07-0.16,
+# so this arm lives AT and below the eps=0.10 threshold where the robot ramps and the rig did
+# not. At sigma 0.03 the rig's inverse gain is 30.0 against the robot's 4.2 -- a 7x larger
+# amplification of the same command noise into joint motion, which is exactly the measured
+# symptom (0.4 deg of joint wiggle producing only 0.43 mm of tool wiggle).
+# IK_MODE=legacy restores the uniform IK_LAMBDA solver for A/B.
+IK_MODE = os.environ.get("IK_MODE", "real").lower()
+IK_DAMPING = float(os.environ.get("IK_DAMPING", "0.02"))
+IK_DAMPING_MAX = float(os.environ.get("IK_DAMPING_MAX", "0.08"))
+IK_SINGULAR_EPS = float(os.environ.get("IK_SINGULAR_EPS", "0.10"))
+IK_MAX_ITERS = int(os.environ.get("IK_MAX_ITERS", "100"))
+IK_MIN_ITERS = int(os.environ.get("IK_MIN_ITERS", "1"))
+IK_POS_TOL = float(os.environ.get("IK_POS_TOL_M", "0.00002"))
+IK_ORI_TOL = float(os.environ.get("IK_ORI_TOL_RAD", "0.0002"))
+IK_MAX_STEP = np.deg2rad(np.array([2.0, 2.0, 2.0, 3.0, 3.0, 4.0]))
 # Single-arm oracle. The oracle's job has narrowed to characterising PICK physics; bimanual
 # choreography (arm-arm interference, races at the pile midline) is task realism the POLICY
 # must face but pure noise for a physics instrument. ORACLE_ARM=left parks the other arm at
@@ -368,14 +500,38 @@ class RuckigArmFollower:
         self.inp.max_velocity = [LIN_V] * 3 + [ANG_V] * 3
         self.inp.max_acceleration = [LIN_A] * 3 + [ANG_A] * 3
         self.inp.max_jerk = [LIN_J] * 3 + [ANG_J] * 3
-        self.inp.current_position = list(pose0)
+        self.tangent = FOLLOWER_ROT == "tangent"
+        # R0: the quaternion base of the orientation tangent (carried as a matrix; the
+        # rig has no quaternion type and a matrix is equally free of the pi wrap).
+        self.R0 = rotvec_to_mat(np.asarray(pose0)[3:]) if self.tangent else None
+        p0 = list(pose0[:3]) + [0.0, 0.0, 0.0] if self.tangent else list(pose0)
+        self.inp.current_position = list(p0)
         self.inp.current_velocity = [0.0] * 6
         self.inp.current_acceleration = [0.0] * 6
-        self.inp.target_position = list(pose0)
+        self.inp.target_position = list(p0)
         self.inp.target_velocity = [0.0] * 6
         self.reference = np.array(pose0, dtype=float)
+        self.reference_velocity = np.zeros(6)
 
-    def set_target(self, pose, vel=None):
+    def _relinearize(self):
+        """Roll the accumulated tangent into R0 and reset axes 3-5 to zero.
+
+        cartesian_chunk_follower.cpp does this in stepToNextSegment(), BEFORE each new
+        solve, so the tangent never grows past the few degrees one knot moves. Velocity and
+        acceleration carry through unchanged -- the same small-angle transfer the C++ relies
+        on -- so the re-base is not a velocity step.
+        """
+        th = np.asarray(self.inp.current_position[3:6], dtype=float)
+        if float(np.linalg.norm(th)) > 0.0:
+            self.R0 = self.R0 @ rotvec_to_mat(th)
+            cp = list(self.inp.current_position)
+            cp[3], cp[4], cp[5] = 0.0, 0.0, 0.0
+            self.inp.current_position = cp
+
+    def _to_tangent(self, pose):
+        return mat_to_rotvec(self.R0.T @ rotvec_to_mat(np.asarray(pose)[3:]))
+
+    def set_target(self, pose, vel=None, neighbors=None, span_dt=None, acc=None):
         """Target a knot WITH a velocity.
 
         chunk_window.hpp keeps `reserve_R` steps of lookahead precisely so each knot can
@@ -383,12 +539,62 @@ class RuckigArmFollower:
         makes Ruckig decelerate to a full stop at every 33 ms knot: the arm accelerates
         and brakes 30 times a second, which is exactly the tremor the real robot does not
         have (it flows through knots at speed).
+
+        `neighbors` = the (lo, hi) knots the caller central-differenced for `vel`. In
+        tangent mode the ANGULAR half of that difference has to be retaken in the current
+        tangent, because the caller computed it on absolute rotvecs that flip sign at the
+        pi boundary -- a flip there produces a bogus 2*pi/dt angular target, clipped to
+        ANG_V, i.e. a full-speed slew in the wrong direction.
         """
-        self.inp.target_position = [float(v) for v in pose]
+        tgt = np.asarray(pose, dtype=float)
+        if self.tangent:
+            self._relinearize()
+            self.inp.target_position = list(tgt[:3]) + list(self._to_tangent(tgt))
+        else:
+            self.inp.target_position = [float(v) for v in tgt]
         if vel is None or os.environ.get("TREMOR_BASELINE") == "1":
             self.inp.target_velocity = [0.0] * 6   # old behaviour: stop at every knot
-        else:
-            self.inp.target_velocity = [float(v) for v in vel]
+            self.inp.target_acceleration = [0.0] * 6
+            return
+        tv = np.asarray(vel, dtype=float).copy()
+        d_k = d_kp1 = None
+        if neighbors is not None and span_dt:
+            half = 0.5 * float(span_dt)          # one policy step of the three-point stencil
+            lo6 = np.asarray(neighbors[0], dtype=float).copy()
+            hi6 = np.asarray(neighbors[1], dtype=float).copy()
+            if self.tangent:
+                # rotation differences must be taken in the current tangent: an absolute-rotvec
+                # difference straddling the pi flip is garbage, and it would both corrupt vf and
+                # fabricate a sign reversal for the corner guard below.
+                lo6[3:] = self._to_tangent(neighbors[0])
+                hi6[3:] = self._to_tangent(neighbors[1])
+                mid = np.concatenate([tgt[:3], self._to_tangent(tgt)])
+            else:
+                mid = tgt
+            d_k, d_kp1 = mid - lo6, hi6 - mid
+            tv = (d_k + d_kp1) / (2.0 * half)
+            # CORNER GUARD (chunk_follower_core.hpp:276): ring down the target velocity on any
+            # axis whose two flanking steps genuinely reverse direction.
+            db = np.array([CORNER_DB_LIN] * 3 + [CORNER_DB_ANG] * 3)
+            s_k = np.sign(np.where(np.abs(d_k) > db, d_k, 0.0))
+            s_p = np.sign(np.where(np.abs(d_kp1) > db, d_kp1, 0.0))
+            rev = (s_k != 0) & (s_p != 0) & (s_k != s_p)
+            tv = np.where(rev, tv * CORNER_SCALE, tv)
+        tv[:3] = np.clip(tv[:3], -LIN_V, LIN_V)
+        tv[3:] = np.clip(tv[3:], -ANG_V, ANG_V)
+        self.inp.target_velocity = [float(v) for v in tv]
+        # af is a BOUNDARY CONDITION on the segment, not a demand (stack_real.yaml). In tangent
+        # mode the angular half is retaken in the current tangent for the same reason the
+        # velocity is: an absolute-rotvec second difference straddling the pi flip is garbage.
+        if acc is None:
+            self.inp.target_acceleration = [0.0] * 6
+            return
+        ta = np.asarray(acc, dtype=float).copy()
+        if d_k is not None:
+            ta = (d_kp1 - d_k) / ((0.5 * float(span_dt)) ** 2)
+        ta[:3] = np.clip(ta[:3] * AF_BETA_LIN, -LIN_A, LIN_A)
+        ta[3:] = np.clip(ta[3:] * AF_BETA_ANG, -ANG_A, ANG_A)
+        self.inp.target_acceleration = [float(v) for v in ta]
 
     def step(self):
         from ruckig import Result
@@ -404,13 +610,88 @@ class RuckigArmFollower:
         if (np.allclose(self.inp.target_position, self.inp.current_position, atol=1e-9)
                 and np.allclose(self.inp.current_velocity, 0.0, atol=1e-7)
                 and np.allclose(self.inp.target_velocity, 0.0, atol=1e-7)):
-            self.reference = np.array(self.inp.current_position, dtype=float)
+            self.reference = self._as_absolute(self.inp.current_position)
+            self.reference_velocity = np.zeros(6)
             return True
 
         res = self.otg.update(self.inp, self.out)
         self.out.pass_to_input(self.inp)
-        self.reference = np.array(self.out.new_position, dtype=float)
+        self.reference = self._as_absolute(self.out.new_position)
+        # xi_ref for the output SMD: the follower's own chained velocity, exactly what
+        # dual_arm_servo_loop hands FollowerOutputSmd::step (core_.v0()). In tangent mode
+        # channels 3-5 are about R0, which to first order is the body frame the SMD
+        # integrates in -- the same approximation the C++ makes.
+        self.reference_velocity = np.asarray(self.out.new_velocity, dtype=float).copy()
         return res in (Result.Working, Result.Finished)
+
+    def _as_absolute(self, p):
+        """The IK consumes an ABSOLUTE pose, so map the tangent back out (tangentPose())."""
+        p = np.asarray(p, dtype=float)
+        if not self.tangent:
+            return p.copy()
+        return np.concatenate([p[:3], mat_to_rotvec(self.R0 @ rotvec_to_mat(p[3:6]))])
+
+
+class FollowerOutputSmd:
+    """Port of rb_servo_server/src/control/follower_output_smd.cpp.
+
+    Continuous 500 Hz post-follower pose conditioner: no command-goal integrator, no goal
+    lead, no chunk-boundary concept. The follower's emitted pose is the reference every tick
+    and all follower bookkeeping stays on the pre-filter stream.
+    """
+
+    RESEED_POS_M = 0.05
+    RESEED_ROT_RAD = 0.10
+
+    def __init__(self, nf_lin, nf_ang, zeta, ff, ff_lpf_hz):
+        self.wn_lin = 2.0 * math.pi * nf_lin
+        self.wn_ang = 2.0 * math.pi * nf_ang
+        self.zeta = zeta
+        self.ff = ff
+        self.ff_lin_hz = ff_lpf_hz if ff_lpf_hz > 0.0 else nf_lin
+        self.ff_ang_hz = ff_lpf_hz if ff_lpf_hz > 0.0 else nf_ang
+        self.active = False
+
+    def reset(self, pose, xi):
+        pose = np.asarray(pose, dtype=float)
+        xi = np.asarray(xi, dtype=float)
+        self.p = pose[:3].copy()
+        self.R = rotvec_to_mat(pose[3:])
+        self.v = xi[:3].copy()
+        self.w = xi[3:].copy()
+        self.v_ff = self.v.copy()
+        self.w_ff = self.w.copy()
+        self.active = True
+
+    def _pose(self):
+        return np.concatenate([self.p, mat_to_rotvec(self.R)])
+
+    def step(self, reference, xi_ref, dt):
+        ref = np.asarray(reference, dtype=float)
+        xi = np.asarray(xi_ref, dtype=float)
+        if not self.active:
+            self.reset(ref, xi)
+            return self._pose()
+        R_ref = rotvec_to_mat(ref[3:])
+        e_rot = mat_to_rotvec(self.R.T @ R_ref)
+        # A stale output state must never pull the command back toward an old pose: snap to
+        # the live pre-filter reference and inherit its chained velocity.
+        if (np.linalg.norm(ref[:3] - self.p) > self.RESEED_POS_M
+                or np.linalg.norm(e_rot) > self.RESEED_ROT_RAD):
+            self.reset(ref, xi)
+            return self._pose()
+        v_d, w_d = np.zeros(3), np.zeros(3)
+        if self.ff:
+            self.v_ff += 2.0 * math.pi * self.ff_lin_hz * (xi[:3] - self.v_ff) * dt
+            self.w_ff += 2.0 * math.pi * self.ff_ang_hz * (xi[3:] - self.w_ff) * dt
+            v_d, w_d = self.v_ff, self.w_ff
+        a = (self.wn_lin ** 2) * (ref[:3] - self.p) + 2.0 * self.zeta * self.wn_lin * (v_d - self.v)
+        self.v = self.v + a * dt
+        self.p = self.p + self.v * dt
+        al = (self.wn_ang ** 2) * e_rot + 2.0 * self.zeta * self.wn_ang * (w_d - self.w)
+        self.w = self.w + al * dt
+        self.R = self.R @ rotvec_to_mat(self.w * dt)
+        return self._pose()
 
 
 def bolt_poses(layout, n_per, seed):
@@ -492,8 +773,10 @@ def _provenance(args, server_metadata: dict | None) -> dict:
     """
     import hashlib
     src = pathlib.Path(__file__).read_bytes()
-    prefixes = ("GRIP_", "BOLT_", "FINGER_", "ORACLE_", "EVAL_", "TREMOR_", "RTC_")
-    names = ("STATE_MODE", "ACTION_MODE", "IK_LAMBDA", "CUDA_VISIBLE_DEVICES", "OMNI_KIT_ACCEPT_EULA")
+    prefixes = ("GRIP_", "BOLT_", "FINGER_", "ORACLE_", "EVAL_", "TREMOR_", "RTC_", "BOX_",
+                "SMD_", "AF_", "IK_", "LIN_", "ANG_", "CORNER_")
+    names = ("STATE_MODE", "ACTION_MODE", "IK_LAMBDA", "CUDA_VISIBLE_DEVICES", "OMNI_KIT_ACCEPT_EULA",
+             "FOLLOWER_ROT", "DRIVE_MODE", "OUTPUT_SMD", "VELPROPRIO_ANCHOR_OVERWRITE")
     return {
         "rig": {
             "script": str(pathlib.Path(__file__).resolve()),
@@ -513,6 +796,18 @@ def _provenance(args, server_metadata: dict | None) -> dict:
             "GRIP_PROPRIO": GRIP_PROPRIO, "GRIP_LEAD": GRIP_LEAD, "GRIP_BIAS": GRIP_BIAS,
             "GRIP_LAG_MS": GRIP_LAG_MS, "GRIP_FLOOR": GRIP_FLOOR,
             "STATE_MODE": STATE_MODE, "ACTION_MODE": ACTION_MODE, "IK_LAMBDA": IK_LAMBDA,
+            "FOLLOWER_ROT": FOLLOWER_ROT, "BOX_DELAY_TICKS": BOX_DELAY_TICKS,
+            "DRIVE_MODE": DRIVE_MODE, "OUTPUT_SMD": OUTPUT_SMD,
+            "SMD": {"nf_lin": SMD_NF_LIN, "nf_ang": SMD_NF_ANG, "zeta": SMD_ZETA,
+                    "ff": SMD_FF, "ff_lpf": SMD_FF_LPF},
+            "VELPROPRIO_ANCHOR_OVERWRITE": VELPROPRIO_ANCHOR_OVERWRITE,
+            "AF_BETA": {"lin": AF_BETA_LIN, "ang": AF_BETA_ANG},
+            "CORNER": {"scale": CORNER_SCALE, "db_lin": CORNER_DB_LIN, "db_ang": CORNER_DB_ANG},
+            "IK": {"mode": IK_MODE, "damping": IK_DAMPING, "damping_max": IK_DAMPING_MAX,
+                   "eps": IK_SINGULAR_EPS, "max_iters": IK_MAX_ITERS,
+                   "pos_tol_m": IK_POS_TOL, "ori_tol_rad": IK_ORI_TOL},
+            "LIMITS": {"lin_v": LIN_V, "lin_a": LIN_A, "lin_j": LIN_J,
+                       "ang_v": ANG_V, "ang_a": ANG_A, "ang_j": ANG_J},
             "ORACLE_ARM": ORACLE_ARM, "ORACLE_RETURN": ORACLE_RETURN,
             # rtc / execute_steps / prefetch_at are recorded as top-level summary fields;
             # PREFETCH_AT in particular is a local of main(), not a module global.
@@ -790,6 +1085,10 @@ def main() -> int:
     world.reset()
     for a in arts.values():
         a.initialize()
+    # DOF order is the articulation's, not ARM_JOINTS'; resolve it once so the 500 Hz
+    # diagnostic read is an array index instead of a list search per substep.
+    _ARM_IDX = {sd: np.array([list(arts[sd].dof_names).index(j) for j in ARM_JOINTS], dtype=int)
+                for sd in arts}
 
     bolt_views = {p: RigidPrim(prim_paths_expr=p, name=f"bv{i}")
                   for i, p in enumerate(bolt_prims)}
@@ -1257,6 +1556,8 @@ def main() -> int:
         R = quat_to_mat(np.asarray(quat)[0].astype(float))
         return p, R
 
+    _kin_prev = {}
+
     def set_arm(side, q_arm, grip):
         art = arts[side]
         names = list(art.dof_names)
@@ -1267,7 +1568,24 @@ def main() -> int:
         for jn, sgn in (("finger_left_joint", +1.0), ("finger_right_joint", -1.0)):
             if jn in names:
                 q[names.index(jn)] = sgn * fp
+        # The drive target is set in BOTH modes: in kinematic mode it keeps the fingers under
+        # their force-limited drive (and stops the solver from fighting the arm state it is
+        # about to be handed), while the arm state is overwritten below.
         art.apply_action(ArticulationAction(joint_positions=q))
+        if DRIVE_MODE != "kinematic":
+            return
+        ix = _ARM_IDX[side]
+        qa = np.asarray(art.get_joint_positions(), dtype=np.float32).copy()
+        qv = np.asarray(art.get_joint_velocities(), dtype=np.float32).copy()
+        prev = _kin_prev.get(side)
+        qa[ix] = np.asarray(q_arm, dtype=np.float32)
+        # Write the velocity the command implies, not zero: a zeroed velocity state would make
+        # every contact read as a standing collision and would itself be a fiction.
+        qv[ix] = ((np.asarray(q_arm) - prev) / PHYSICS_DT if prev is not None
+                  else np.zeros(len(ix)))
+        _kin_prev[side] = np.asarray(q_arm, dtype=float).copy()
+        art.set_joint_positions(qa)
+        art.set_joint_velocities(qv)
 
     T_mount = {}
     for side, m in mount_xf.items():
@@ -1437,6 +1755,9 @@ def main() -> int:
 
         # ---- follower + command state ---------------------------------------
         followers, cmd_hist, grip_cmd, q_cmd = {}, {}, {}, {}
+        q_hist = {}
+        smds = {}
+        _sent_q = {}      # what actually reached the drives this substep, per arm
         for side in MOUNT_FRAME:
             if ORACLE_RETURN and side in _RET_Q:
                 q_cmd[side] = _RET_Q[side].copy()
@@ -1451,6 +1772,11 @@ def main() -> int:
             p, R = tcp_pose(side)
             pose6 = np.concatenate([p, mat_to_rotvec(R)])
             followers[side] = RuckigArmFollower(pose6)
+            smds[side] = (FollowerOutputSmd(SMD_NF_LIN, SMD_NF_ANG, SMD_ZETA, SMD_FF,
+                                            SMD_FF_LPF) if OUTPUT_SMD else None)
+            if smds[side] is not None:
+                smds[side].reset(pose6, np.zeros(6))
+            q_hist[side] = []          # box FIFO: q_ref at the 500 Hz servo tick
             cmd_hist[side] = [pose6.copy(), pose6.copy()]
             grip_cmd[side] = 100.0
 
@@ -1468,7 +1794,8 @@ def main() -> int:
         knots = {s_: None for s_ in MOUNT_FRAME}
         tcp_log = {s_: [] for s_ in MOUNT_FRAME}
         sub_i = -1
-        dg = {s_: {k: [] for k in ("dq", "res", "smin", "grip", "refz", "cmdtcp", "q", "gq")}
+        dg = {s_: {k: [] for k in ("dq", "res", "smin", "grip", "refz", "cmdtcp", "q", "gq",
+                                   "qact", "qdact", "knot", "ref", "refpre")}
               for s_ in MOUNT_FRAME}
         rtc_prev_raw = None      # reset per episode, like _rtc_prev_raw_chunk
         pending = None           # (full chunk (H,14), obs_tick) kicked at prefetch_at, swapped at boundary
@@ -1679,7 +2006,9 @@ def main() -> int:
                 for side in ("left", "right"):
                     p_a, R_a, _, _ = fk_chain(q_cmd[side], T_mount[side])
                     anchor_pose = np.concatenate([p_a, mat_to_rotvec(R_a)])
-                    cmd_hist[side][-1] = anchor_pose
+                    if VELPROPRIO_ANCHOR_OVERWRITE:
+                        # historical behaviour: the anchor lands in the velproprio history
+                        cmd_hist[side][-1] = anchor_pose
                     # Integrate the whole horizon into absolute knots so the follower can
                     # look ahead; knots[0] is the anchor itself.
                     ks = [anchor_pose.copy()]
@@ -1699,6 +2028,21 @@ def main() -> int:
                             nl = np.linalg.norm(step)
                             if nl > LIN_V * POLICY_DT:
                                 tp = prev[:3] + step * (LIN_V * POLICY_DT / nl)
+                            # ROTATION spacing, the twin of the position clamp above. The
+                            # delta branch below has always clamped both; this branch clamped
+                            # only position, so anchored chunks handed the follower knot-to-knot
+                            # rotations the follower cannot execute (ANG_V*dt = 1.72 deg).
+                            # Measured 2026-09-03: 3-39% of anchored knot steps exceeded that,
+                            # p99 up to 10.2 deg, and the commanded attitude churned 13-63 deg/s
+                            # against 9.6-9.9 deg/s on the real robot's own follower_replay knots
+                            # (where p99 is 1.2-1.4 deg and >1.8 deg is 0.1-0.3% -- the signature
+                            # of exactly this clamp). Saturating the follower's angular limit is
+                            # what makes the arm churn while the tool tracks.
+                            dR = mat_to_rotvec(rotvec_to_mat(prev[3:]).T @ tR)
+                            na_ = float(np.linalg.norm(dR))
+                            if na_ > ANG_V * POLICY_DT:
+                                tR = rotvec_to_mat(prev[3:]) @ rotvec_to_mat(
+                                    dR * (ANG_V * POLICY_DT / na_))
                             k_ = np.concatenate([tp, mat_to_rotvec(tR)])
                             ks.append(k_)
                             prev = k_
@@ -1737,10 +2081,24 @@ def main() -> int:
                 tvel = (ks[hi] - ks[lo]) / (max(1, hi - lo) * POLICY_DT)
                 tvel[:3] = np.clip(tvel[:3], -LIN_V, LIN_V)
                 tvel[3:] = np.clip(tvel[3:], -ANG_V, ANG_V)
+                # Only a genuine three-point stencil defines a second difference; at the data
+                # edge the follower decelerates into the tail, which is af = 0 (the C++ clamps
+                # its flanking indices the same way).
+                tacc = ((ks[hi] - 2.0 * ks[k] + ks[lo]) / (POLICY_DT ** 2)
+                        if (hi - lo) == 2 else None)
                 cmd_hist[side].append(new_pose.copy())
                 if len(cmd_hist[side]) > 64:
                     cmd_hist[side].pop(0)
-                followers[side].set_target(new_pose, tvel)
+                followers[side].set_target(new_pose, tvel,
+                                           neighbors=(ks[lo], ks[hi]),
+                                           span_dt=max(1, hi - lo) * POLICY_DT,
+                                           acc=tacc)
+                if DIAG:
+                    # The 30 Hz knot the follower is aiming at, i.e. the POLICY's own path
+                    # after chunk integration and re-anchoring but BEFORE Ruckig and IK.
+                    # Logged so a wiggle can be attributed to the model output rather than
+                    # to the rig's follower.
+                    dg[side]["knot"].append(np.asarray(new_pose, dtype=np.float64).copy())
                 row = chunk[side][min(chunk_idx, chunk[side].shape[0] - 1)]
                 # GRIPPER LEAD. UMI records (pose_k, grip_k) as one synchronous measurement of a
                 # human hand: there is no command/actual split and no latency, so grip_k means
@@ -2000,18 +2358,37 @@ def main() -> int:
                         set_arm(side, q_cmd[side], 100.0)
                         continue
                     followers[side].step()
-                    ref = followers[side].reference
+                    ref_pre = followers[side].reference
+                    ref = (smds[side].step(ref_pre, followers[side].reference_velocity,
+                                           PHYSICS_DT)
+                           if smds[side] is not None else ref_pre)
                     qc = q_cmd[side]
                     p_fk, R_fk, _, _ = fk_chain(qc, T_mount[side])
                     err = np.concatenate([ref[:3] - p_fk,
                                           mat_to_rotvec(rotvec_to_mat(ref[3:]) @ R_fk.T)])
-                    for _ in range(IK_ITERS):
+                    _n_it = IK_MAX_ITERS if IK_MODE == "real" else IK_ITERS
+                    for _it in range(_n_it):
                         J = jacobian(qc, T_mount[side])
-                        dq = J.T @ np.linalg.solve(J @ J.T + IK_LAMBDA * np.eye(6), err)
+                        if IK_MODE == "real":
+                            U_, S_, Vt_ = np.linalg.svd(J)
+                            lam2 = np.full(6, IK_DAMPING * IK_DAMPING)
+                            if IK_SINGULAR_EPS > 0.0 and IK_DAMPING_MAX > 0.0:
+                                r_ = S_ / IK_SINGULAR_EPS
+                                lam2 = lam2 + np.where(
+                                    S_ < IK_SINGULAR_EPS,
+                                    IK_DAMPING_MAX * IK_DAMPING_MAX * (1.0 - r_ * r_), 0.0)
+                            dq = Vt_.T @ ((S_ / (S_ * S_ + lam2)) * (U_.T @ err))
+                            dq = np.clip(dq, -IK_MAX_STEP, IK_MAX_STEP)
+                        else:
+                            dq = J.T @ np.linalg.solve(J @ J.T + IK_LAMBDA * np.eye(6), err)
                         qc = np.clip(qc + np.clip(dq, -DQ_MAX, DQ_MAX), JOINT_LO, JOINT_HI)
                         p_fk, R_fk, _, _ = fk_chain(qc, T_mount[side])
                         err = np.concatenate([ref[:3] - p_fk,
                                               mat_to_rotvec(rotvec_to_mat(ref[3:]) @ R_fk.T)])
+                        if (IK_MODE == "real" and (_it + 1) >= IK_MIN_ITERS
+                                and np.linalg.norm(err[:3]) < IK_POS_TOL
+                                and np.linalg.norm(err[3:]) < IK_ORI_TOL):
+                            break
                     q_cmd[side] = qc
                     if _REP is not None:
                         gi = min(sub_i, len(_REP[f"{side}_q"]) - 1)
@@ -2022,7 +2399,17 @@ def main() -> int:
                     lag_t = int(round(GRIP_LAG_MS[side] / 1000.0 / POLICY_DT))
                     h = grip_hist[side]
                     g_apply = h[max(0, len(h) - 1 - lag_t)] if h else grip_cmd[side]
-                    set_arm(side, q_cmd[side], g_apply)
+                    # The DRIVES get the delayed joint command; q_cmd stays the command, which
+                    # is what chunk_anchor=command, the velocity proprio and the logs mean --
+                    # the same split the grip lag above uses, and the same one the robot has
+                    # (the host anchors on what it sent, not on what the box has replayed yet).
+                    qh = q_hist[side]
+                    qh.append(q_cmd[side].copy())
+                    if len(qh) > BOX_DELAY_TICKS + 2:
+                        qh.pop(0)
+                    q_apply = qh[max(0, len(qh) - 1 - BOX_DELAY_TICKS)]
+                    set_arm(side, q_apply, g_apply)
+                    _sent_q[side] = q_apply
                     if DIAG:
                         # sigma_min exposes a near-singular wrist, where DLS damping turns
                         # a small Cartesian error into a large, sign-flipping joint step.
@@ -2035,17 +2422,48 @@ def main() -> int:
                         # The decisive split: COMMANDED tcp (analytic FK of the joint
                         # command) vs MEASURED tcp. If commanded is smooth while measured
                         # shakes, the tremor is physics/contact, not the controller.
+                        dg[side]["ref"].append(np.asarray(ref, dtype=np.float64).copy())
+                        dg[side]["refpre"].append(np.asarray(ref_pre, dtype=np.float64).copy())
                         dg[side]["cmdtcp"].append(
                             fk_chain(q_cmd[side], T_mount[side])[0].copy())
                         dg[side]["q"].append(q_cmd[side].copy())
                         dg[side]["gq"].append(grip_cmd[side])
                 world.step(render=False)
+                if DRIVE_MODE == "kinematic":
+                    # Re-assert AFTER the step. Writing the state before world.step() is not
+                    # enough: the step still integrates one dt of velocity, gravity, drive and
+                    # contact on top of it, which left FK(q_actual) jerk at 645 um against
+                    # FK(q_ref) 35 um -- i.e. not the kinematic arm this mode is supposed to
+                    # be. Re-asserting here makes q_actual == q_ref exactly, which is the
+                    # whole point of the diagnostic; the step before it is what lets the
+                    # fingers and the bolts still see the arm.
+                    for side in ("left", "right"):
+                        if side in _sent_q:
+                            _art = arts[side]
+                            _qa = np.asarray(_art.get_joint_positions(), dtype=np.float32).copy()
+                            _qv = np.asarray(_art.get_joint_velocities(), dtype=np.float32).copy()
+                            _ix = _ARM_IDX[side]
+                            _qa[_ix] = np.asarray(_sent_q[side], dtype=np.float32)
+                            _qv[_ix] = 0.0
+                            _art.set_joint_positions(_qa)
+                            _art.set_joint_velocities(_qv)
                 # Sample at the PHYSICS rate, not the policy rate. The tremor lives INSIDE
                 # the 33 ms knot interval (accelerate then brake across 17 substeps);
                 # sampling once per knot aliases it away completely, which is why the first
                 # version of this metric was blind to the very thing it was measuring.
                 for side in ("left", "right"):
                     tcp_log[side].append(tcp_pose(side)[0].copy())
+                    if DIAG:
+                        # q_ref vs q_actual, sampled AFTER the step so it lines up with the
+                        # measured TCP above. The commanded side (dg["q"]) is written before
+                        # the step, so comparing the two raw streams costs one substep of
+                        # skew; _ARM_IDX makes the joint read cheap enough to do at 500 Hz.
+                        _art = arts[side]
+                        _qa = np.asarray(_art.get_joint_positions()).reshape(-1)
+                        _qv = np.asarray(_art.get_joint_velocities()).reshape(-1)
+                        _ix = _ARM_IDX[side]
+                        dg[side]["qact"].append(_qa[_ix].astype(np.float64).copy())
+                        dg[side]["qdact"].append(_qv[_ix].astype(np.float64).copy())
 
             if ep == 0 and tick % 30 == 0:
                 dbg = []

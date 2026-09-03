@@ -10,6 +10,27 @@
 - 상세 핸드오프/이력: [`CLAUDE.md`](CLAUDE.md) (빌드 사다리, 함정 목록, 단계별 검증 기록)
 - 연구 기록: llm-wiki `projects/isaac-sim-eval-rig.md`
 
+## 제어기 동일성 원칙
+
+**이 리그의 제어기는 robotics_lab 실기 제어기와 같은 것이고, 파라미터까지 같아야 합니다.
+sim 성공률이 떨어지더라도 실기와 일치하는 쪽을 택합니다.** 값을 바꾸고 싶으면 sim에서
+튜닝하지 말고 `stack_real.yaml`을 근거로 제시하세요. 전수 대조표와 각 항목의 실기 근거는
+[`CLAUDE.md` §21](CLAUDE.md).
+
+⚠️ **정본 config는 HEAD가 아닙니다.** `stack_real.yaml`/`stack_sim.yaml`은 2026-09-02에 둘 다
+RB5-850E로 전환됐고 이 리그는 RB3-730E입니다. 반드시 전환 직전 커밋에서 읽으세요:
+
+```bash
+git -C ~/workspace/robotics_lab show fad2cd4^:rb_servo_server/config/stack_real.yaml
+```
+
+실기에서 옮겨온 단: Ruckig 팔로워(중앙차분 vf + 2차차분 af + corner ring-down), IK 직전
+`FollowerOutputSmd`, SVD 선택적 damped least squares. 기본값은 전부 실기 값입니다.
+
+⚠️ **떨림 A/B를 `tremor_um`으로 판정하지 마세요.** 2차차분이라 f² 가중이고, 떨림이 실제로 사는
+3-15 Hz에 눈이 멉니다. 쓸 지표는 자유공간 3-15 Hz 잔차 RMS, knot 회전 churn(deg/s),
+그리고 짝지은 단별 감쇠(`refpre`→`ref`)입니다.
+
 ## 검증 상태 (2026-08-23)
 
 | 항목 | 상태 |
@@ -87,6 +108,24 @@ env GRIP_RATE=3 GRIP_MAXF=5 ORACLE_ARM=left GRIP_OPEN=50 BOLT_SPREAD=2.5 \
 | `GRIP_OPEN` | 열림 상한 [%] — 50이면 밀집 더미에서 이웃 걸림 대폭 감소 | 오라클 |
 | `ORACLE_ARM` | `left`/`right` 단팔 모드 (반대팔 q=0 주차) | 오라클 |
 | `BOLT_SPREAD` | 더미 산포 배율 (희소 씬 생성용; 채점은 1.0 고정) | 씬 |
+
+### 제어기 노브 (기본값 = 실기 `stack_real.yaml` RB3 프로파일)
+
+바꾸기 전에 CLAUDE.md §21을 읽으세요. 기본값에서 벗어나면 더 이상 실기 제어기가 아닙니다.
+
+| 노브 | 기본 | 의미 |
+|---|---|---|
+| `OUTPUT_SMD` | 1 | IK 직전 `FollowerOutputSmd`. 0 = 이식 전 리그 |
+| `SMD_NF_LINEAR_HZ` / `SMD_NF_ANGULAR_HZ` | 3.5 / 2.5 | SMD 고유주파수 [Hz] |
+| `IK_MODE` | real | SVD 선택적 DLS. `legacy` = λ²=1e-4 균일 |
+| `IK_DAMPING` / `IK_DAMPING_MAX` / `IK_SINGULAR_EPS` | 0.02 / 0.08 / 0.10 | |
+| `LIN_JERK` / `ANG_JERK` | 2000 / 4000 | 팔로워 jerk 한계 |
+| `AF_BETA_LIN` / `AF_BETA_ANG` | 1.0 / 1.0 | 가속 피드포워드 감쇠 |
+| `CORNER_VELOCITY_SCALE` | 0.25 | 방향 반전 시 목표속도 ring-down |
+| `FOLLOWER_ROT` | tangent | 쿼터니언 기준 접선. `abs` = π 뒤집힘 버그 재현 |
+| `VELPROPRIO_ANCHOR_OVERWRITE` | 0 | 1 = 앵커가 velproprio 이력을 덮어쓰는 과거 동작 |
+| `BOX_DELAY_TICKS` | 0 | 컨트롤박스 FIFO 지연 [2 ms 틱]. 실측값은 8 |
+| `DRIVE_MODE` | drive | `kinematic` = 진단 전용(팔 텔레포트, 파지가 죽음) |
 
 ### 에피소드 샤딩 (한 실험을 GPU 여러 개로)
 

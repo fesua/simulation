@@ -153,20 +153,54 @@ ACTION_MODE = os.environ.get("ACTION_MODE", "delta").lower()
 # rotation -> 30-50 mm chunk-boundary jumps, base-ward drift; the sim ran the same bad math
 # with milder symptoms -- likely part of anchored's 3x tremor). Unnormalize with the served
 # checkpoint's action q01/q99, transform, renormalize. RTC_NORM_STATS overrides the default.
-RTC_NORM_STATS = os.environ.get("RTC_NORM_STATS") or (
-    os.path.expanduser("~/workspace/openpi_runs/assets/pi05_pika_umi_wrist_anchored_velgrip_k1"
-                       "_h24_40k/plaif/pika_umi_video_train_tcp_anchored_velgrip_k1/norm_stats.json")
-    if ACTION_MODE == "anchored" else "")
+# This used to default to a HARDCODED path -- one specific checkpoint's norm stats. Serving
+# any other anchored checkpoint then loaded the wrong normalisation SILENTLY, because that
+# file exists and the "not found" warning below never fired. The stats are now taken from the
+# SERVED checkpoint (see _checkpoint_contract); this variable is the override only.
+RTC_NORM_STATS = os.environ.get("RTC_NORM_STATS", "")
 _RTC_NORM_Q = None
-if ACTION_MODE == "anchored" and RTC_NORM_STATS and os.path.exists(RTC_NORM_STATS):
+_CONTRACT: dict = {}      # what the served checkpoint says; filled once the server is known
+
+
+def _load_rtc_norm_stats(path: str) -> bool:
+    """Load action q01/q99 for the anchored RTC re-anchor. Returns whether it took."""
+    global _RTC_NORM_Q
+    if not path or not os.path.exists(path):
+        return False
     import json as _json_ns
-    _a_ns = _json_ns.load(open(RTC_NORM_STATS))["norm_stats"]["actions"]
-    _RTC_NORM_Q = (np.asarray(_a_ns["q01"], dtype=np.float64)[:14],
-                   np.asarray(_a_ns["q99"], dtype=np.float64)[:14])
-    print(f"[eval] anchored RTC norm stats loaded: {RTC_NORM_STATS}")
-elif ACTION_MODE == "anchored":
-    print("[eval] WARNING: ACTION_MODE=anchored but no RTC_NORM_STATS found -> "
-          "RTC prev-chunk conditioning will be DISABLED (vanilla sampling)")
+    a = _json_ns.load(open(path))["norm_stats"]["actions"]
+    _RTC_NORM_Q = (np.asarray(a["q01"], dtype=np.float64)[:14],
+                   np.asarray(a["q99"], dtype=np.float64)[:14])
+    print(f"[eval] anchored RTC norm stats: {path}")
+    return True
+
+
+def _checkpoint_contract(policy_dir: str) -> dict:
+    """What ACTION contract the served checkpoint was TRAINED under, read from the
+    checkpoint itself.
+
+    The rig cannot ask the server this -- openpi's websocket metadata does not carry it --
+    and getting it wrong is not a subtle error. An `anchored` checkpoint emits 24 rows that
+    are each an INDEPENDENT offset from the chunk anchor; the `delta` branch chains them, so
+    the command accumulates ~24 waypoints' worth of offset per chunk and the arm leaves the
+    workspace. Measured on :8002 (pi05_pika_umi_boltv2_anchAB_ph3_h24_40k, 2026-09-04):
+    decoded as delta the gripper closed with the bolt 270.6 mm BELOW it; decoded as anchored,
+    -5.9 mm. Same policy, same scene, same seed.
+
+    The signal is the training dataset's name, which openpi writes into the checkpoint's own
+    assets tree next to the norm stats:
+        ..._tcp_anchored_...  -> anchored      ..._tcp_gripabs_...  -> delta
+    Verified across every checkpoint on this machine (anchAB/anchored/boltv2/boltv2ph3 are
+    anchored; pad/v2_nolang/velgrip_real are gripabs).
+    """
+    import glob
+    hits = sorted(glob.glob(os.path.join(policy_dir, "assets", "*", "*", "norm_stats.json")))
+    if not hits:
+        return {}
+    dataset = os.path.basename(os.path.dirname(hits[0]))
+    mode = ("anchored" if "_tcp_anchored_" in dataset else
+            "delta" if "_tcp_gripabs_" in dataset else "")
+    return {"dataset": dataset, "action_mode": mode, "norm_stats": hits[0]}
 
 
 def _rtc_unnorm(n, q01, q99):
@@ -844,6 +878,9 @@ def _provenance(args, server_metadata: dict | None) -> dict:
             # the collider (flat hull -> arched SDF) and what the wrist camera sees. The
             # asset path is recorded, not just the flag, because the flag only names a
             # directory that a rebuild can change underneath it.
+            # What the SERVED checkpoint was trained under, next to what the rig decoded
+            # it as. A summary that records only the latter cannot be audited.
+            "checkpoint_contract": _CONTRACT,
             "PIKA_TIP": PIKA_TIP,
             "ARM_USD": str(ARM_USD),
             "FINGER_TRAVEL_M": FINGER_TRAVEL_M,
@@ -1583,7 +1620,48 @@ def main() -> int:
     if client is not None:
         server_metadata = client.get_server_metadata()
         print(f"server metadata: {server_metadata}")
-        
+        # ---- ACTION CONTRACT GATE -----------------------------------------------------
+        # The decode mode is a flag on this side and a training choice on that side, and
+        # nothing was checking they agreed. On 2026-09-04 :8002 was restarted onto an
+        # anchored checkpoint while the rig kept its `delta` default; the run looked
+        # healthy (blank_obs 0, closes logged, video written) and was pure garbage -- the
+        # gripper closed 270 mm above the bolts. Refuse to score that.
+        _ck = _resolve_served_checkpoint(args.host, args.port)
+        _con = _checkpoint_contract(_ck.get("dir", "")) if _ck.get("resolved") else {}
+        global _CONTRACT
+        _CONTRACT = _con
+        if _con.get("action_mode"):
+            print(f"[eval] served checkpoint trained on {_con['dataset']} "
+                  f"-> action_mode={_con['action_mode']}")
+            if _con["action_mode"] != ACTION_MODE:
+                # The escape hatch is deliberate: STATE_MODE/ACTION_MODE exist BECAUSE this
+                # rig runs interface experiments (section 18), and a gate with no override
+                # would be the wrong kind of strict. But it has to be typed, not defaulted.
+                msg = (f"ACTION_MODE={ACTION_MODE} but the served checkpoint was trained "
+                       f"{_con['action_mode']} ({_con['dataset']}). Decoding anchored rows "
+                       f"as chained deltas puts the command ~24 waypoints past the anchor "
+                       f"every chunk; the run scores 0 and looks normal doing it "
+                       f"(measured 2026-09-04: bolt 270.6 mm below the closing jaw).")
+                if os.environ.get("ALLOW_CONTRACT_MISMATCH") != "1":
+                    raise SystemExit(
+                        f"ABORT: {msg}\n"
+                        f"  Re-run with ACTION_MODE={_con['action_mode']}.\n"
+                        f"  If the mismatch IS the experiment, set "
+                        f"ALLOW_CONTRACT_MISMATCH=1 to proceed.")
+                print(f"[eval] !! CONTRACT MISMATCH ALLOWED: {msg}")
+            if ACTION_MODE == "anchored" and not RTC_NORM_STATS:
+                # From the SERVED checkpoint, never a hardcoded path -- the re-anchor is
+                # SE(3) algebra and needs THIS model's action q01/q99 to unnormalise.
+                _load_rtc_norm_stats(_con["norm_stats"])
+        else:
+            print(f"[eval] WARNING: could not read the served checkpoint's action contract "
+                  f"({_ck.get('dir', 'unresolved')}); ACTION_MODE={ACTION_MODE} is "
+                  f"UNVERIFIED against the model.")
+        if RTC_NORM_STATS:
+            _load_rtc_norm_stats(RTC_NORM_STATS)
+        if ACTION_MODE == "anchored" and _RTC_NORM_Q is None:
+            print("[eval] WARNING: anchored but no norm stats -> RTC prev-chunk "
+                  "conditioning DISABLED (vanilla sampling)")
     else:
         print("ORACLE mode: privileged-state planner, no policy server")
         server_metadata = None

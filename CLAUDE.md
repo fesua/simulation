@@ -1121,3 +1121,69 @@ foot boss에 **비다양체 에지 10개**, 부호 반대로 거의 상쇄되는
 - `outputs/eval/tipv15_hand_aligned_00.mp4` — 오버뷰 영상 (598 프레임).
 
 `blank_obs 0`으로 유효 런이다.
+
+## 23. sim이 "엉터리"였던 이유 = 액션 디코딩 계약 불일치 (2026-09-04)
+
+운영자: ":8002 모델은 실기에서 가끔 성공하는데 sim에서는 아예 엉터리다. 팁은 새로 장착한
+걸로 학습했으니 OOD는 아닐 텐데."
+
+**OOD가 아니었다. 리그가 앵커 상대 웨이포인트를 체인 델타로 디코딩하고 있었다.**
+
+### 증거
+
+:8002가 서빙 중인 것은 `pi05_pika_umi_boltv2_anchAB_ph3_h24_40k`이고 openpi config가
+**`action_mode="anchored"`** 다. 그런데 리그는 `ACTION_MODE`의 기본값인 `delta`로 돌았다.
+같은 씬·같은 seed·같은 정책으로 20초 A/B:
+
+| | `delta` (틀림) | `anchored` (맞음) |
+|---|---|---|
+| close 시 **dz p50** | **+270.6 mm** | **−5.9 mm** |
+| close 시 dxy p50 | 59.6 mm | 111.6 mm |
+| close 횟수 | 12 | 3 |
+
+**dz +270mm** = 조를 볼트보다 27cm 위 허공에서 닫고 있었다. anchored로 디코딩하면 볼트
+높이에서 닫는다. 손목캠 컨택트 시트에서도 delta 런은 t=180 이후 화면이 빈 테이블과 박스
+벽뿐이었다 — 팔이 위로 떠나가고 있었던 것.
+
+원리: anchored 청크의 24행은 **각각 앵커에서의 독립 오프셋**이다. delta 분기는 이걸
+`cur_p = cur_p + cur_R·dl`로 **누적**하므로, 청크마다 웨이포인트 24개어치 오프셋이 쌓인다.
+execute 4로 매 4틱 재앵커링해도 평균 오프셋 방향으로 계속 끌려간다.
+
+### 왜 조용히 통과했나
+
+이 런은 **건강해 보였다**: `blank_obs 0`, close 이벤트 기록됨, mp4 정상, 추론 지연 정상.
+§20의 교훈("관측 경로의 폴백은 소리를 내야 한다")의 액션 경로 판이다. `ACTION_MODE`는 이쪽의
+플래그이고 저쪽의 학습 선택인데 **둘이 맞는지 아무도 안 보고 있었다.**
+
+### 가드 (구현됨)
+
+openpi 웹소켓 metadata에는 `{action_horizon, action_dim}`뿐이라 서버에 물어볼 수 없다.
+대신 **체크포인트 자신이 답을 갖고 있다** — openpi가 norm stats 옆에 학습 데이터셋 이름을
+써 두고, 그 이름이 계약을 인코딩한다:
+
+```
+..._tcp_anchored_...  -> anchored      ..._tcp_gripabs_...  -> delta
+```
+
+이 머신의 전 체크포인트에서 확인: anchAB/anchored/boltv2/boltv2ph3 = anchored,
+pad/v2_nolang/velgrip_real = gripabs. `_checkpoint_contract()`가 서빙 프로세스의
+`--policy.dir`에서 이걸 읽고, **`ACTION_MODE`와 다르면 시작 시 abort**한다.
+계약은 summary provenance(`checkpoint_contract`)에도 남는다.
+
+탈출구는 `ALLOW_CONTRACT_MISMATCH=1` 하나뿐이고 **명시적으로 타이핑해야** 한다 —
+STATE_MODE/ACTION_MODE는 애초에 인터페이스 실험용으로 만든 노브라(§18) 막기만 하는 게이트는
+틀린 종류의 엄격함이지만, 기본값으로 새어나가면 이번 사고가 반복된다.
+
+### 함께 막은 지뢰: RTC norm stats 하드코딩
+
+`RTC_NORM_STATS` 기본값이 **특정 옛 체크포인트의 경로로 하드코딩**돼 있었다. 다른 anchored
+체크포인트를 서빙하면 그 파일이 존재하기 때문에 "없음" 경고가 안 뜨고 **틀린 정규화를 조용히
+로드**한다. anchored RTC 재앵커링은 SE(3) 연산이라 이 모델의 action q01/q99가 필요하다
+(§ dfb897a). 이제 **서빙 중인 체크포인트에서** 읽는다.
+
+### 아직 안 끝난 것
+
+`anchored`로 고쳐도 **dxy p50 111.6mm** 로 측면 조준이 크다(n=3 close라 표본은 약하다).
+높이 문제는 디코딩이 전부였지만 측면 정확도는 별개 질문으로 남아 있다. 실기가 "가끔 성공"
+하는 모델이라면 sim의 남은 격차는 여기서 봐야 한다 — §21의 미판정 항목(정책 청크 회전
+요구량이 실기 대비 3배)과 같은 줄에 놓고 볼 것.

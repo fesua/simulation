@@ -828,3 +828,166 @@ summary에 `blank_obs`가 0이 아니면 `!! INVALID RUN`을 찍는다.
 **과거 런은 무사하다**: post/ab_rtc/s5/nolang/v2lang/cmp_* 는 전부 비디오 ON으로 돌았고
 (mp4가 있다) orchestrator가 매 틱 스텝했다. 관측 타이밍(틱 끝 렌더 → 다음 틱 관측,
 33ms 카메라 지연)도 수정 후 그대로 보존했다.
+
+## 21. 제어기 동일성 원칙 + stack_real.yaml 전수 대조 (2026-09-03)
+
+### 원칙 (운영자 결정, 이 리그의 상위 규칙)
+
+**이 리그의 제어기는 robotics_lab 실기 제어기와 같은 것이다. 파라미터까지 같아야 한다.
+sim 성공률이 떨어지더라도 실기 제어기와 일치하는 쪽을 택한다.**
+
+§19의 "떨림은 스무딩이 아니라 물리로 잡는다"와 충돌하지 않는다. 금지 대상은 **실기에 없는**
+감쇠 가드를 sim에 새로 만들어 넣는 것이고, **실기가 이미 돌리고 있는 단**을 옮겨오는 것은
+충실도다. 판정 기준은 "부드러워지는가"가 아니라 "`stack_real.yaml`에 있는가" 하나다.
+어떤 값을 바꾸고 싶으면 sim에서 튜닝하지 말고 실기 config를 근거로 제시할 것.
+
+### ⚠️ 정본 config는 HEAD가 아니라 `fad2cd4^` 다
+
+`stack_real.yaml`과 `stack_sim.yaml`은 **2026-09-02에 둘 다 RB5-850E로 전환**됐다
+(`fad2cd4` "Switch stack_real to the RB5-850E", `9b295d6` stack_sim). 이 리그는 **RB3-730E**다.
+HEAD를 그대로 베끼면 다른 팔의 값을 넣게 된다. 반드시 이렇게 읽을 것:
+
+```bash
+git -C ~/workspace/robotics_lab show fad2cd4^:rb_servo_server/config/stack_real.yaml
+```
+
+### 전수 대조 결과 (2026-09-03 시점, 전부 반영 완료)
+
+| 항목 | 실기 (RB3 프로파일) | 이 리그 (이전) | 조치 |
+|---|---|---|---|
+| `max_linear_velocity_m_s` | 0.45 | 0.45 | 일치 |
+| `max_linear_accel_m_s2` | 12.0 | 12.0 | 일치 |
+| `max_linear_jerk_m_s3` | **2000** | 4000 | 맞춤 (`LIN_JERK`) |
+| `max_angular_velocity_rad_s` | 0.90 | 0.90 | 일치 |
+| `max_angular_accel_rad_s2` | 40.0 | 40.0 | 일치 |
+| `max_angular_jerk_rad_s3` | **4000** | 8000 | 맞춤 (`ANG_JERK`) |
+| `output_smd.enable` | **true** | 단 자체가 없음 | 이식, 기본 ON (`OUTPUT_SMD`) |
+| `output_smd` nf/zeta/ff | 3.5 / 2.5 Hz, 1.0, on | — | 동일값 |
+| `af_damping_beta_lin/ang` | **1.0 / 1.0** | 가속 FF 자체가 없음 | 중앙 2차차분 af 전달 |
+| `corner_velocity_scale` | **0.25** | 없음 | 이식 (`CORNER_VELOCITY_SCALE`) |
+| `corner_deadband_lin/ang` | 0.0003 m / 0.0005 rad | 없음 | 이식 |
+| `ik.damping` | **0.02** (λ²=4e-4) | 1e-4 균일 | SVD 선택적 DLS로 교체 |
+| `ik.damping_max` / `singular_region_eps` | **0.08 / 0.10** | 없음 | 이식 |
+| `ik.max_iterations` / `min_iterations` | 100 / 1 | 3회 고정 | 이식 |
+| `ik.position_tolerance_m` | 0.00002 | 없음 | 이식 |
+| `ik.orientation_tolerance_rad` | 0.0002 | 없음 | 이식 |
+| `ik.max_step_deg` | [2,2,2,3,3,4] | 없음 | 이식 |
+| `dq_max_deg_s` | [170,170,170,240,240,320] | 동일 | 일치 |
+| elbow `q_max_deg` | ±150 | ±150 | 일치 |
+| `smoothing_window` | 1 (= 꺼짐) | 없음(=1) | 일치 |
+| `discard_head_steps` | 0 | 등가 처리 | 일치 |
+| `reserve_steps` (flank ±1) | 4 | ±1 | 일치 |
+| `SPEED_SCALE` | 1.0 | 1.0 | 일치 |
+
+**여기에 없는 실기 단**: 컨트롤박스 전송 지연. 실기는 순수 데드타임이다 — `BOX_DELAY_TICKS`로
+모사 가능하나 기본 0 (아래 참조).
+
+### 각 항목의 근거 (실기 config 주석에서)
+
+- **jerk 절반 (2026-08-28)**: "dt 2 ms에서 4000 m/s^3은 한 틱에 가속을 8 m/s^2 흔들어 12 m/s^2
+  천장에 ~3 ms만에 닿는다 — near-step acceleration, broadband, 11-13 Hz 모드 직격."
+  가속(12/40)은 낮추지 않는다. 실기 feasibility 비용은 conv 93.1→90.0% 수준으로 작았다.
+- **output SMD**: IK 직전 500 Hz 상시 2차 임계감쇠 트래커 + 저역통과된 속도 FF.
+  `H(s) = wn^2 (3s + wn) / (s + wn)^3`. 속도 FF가 1차 지연을 상쇄하므로 평범한 LPF가 아니다 —
+  0.5-3 Hz는 1.06-1.30배로 통과하고 ~4.3 Hz 위부터 깎는다. 청크 경계 상태가 없다
+  (per-chunk FIR은 5.74 Hz 경계 콤을 만들어 실기에서 기각됐다).
+  2026-07-31 하드웨어 수용시험: 13-20 Hz 89-109x / 10-13 Hz 22-31x / 5-10 Hz 4.5-5.1x 감쇠,
+  과제대역 1-5 Hz 1.15x 유지, 경로편차 p50 0.42 / p95 3.5 mm.
+- **가속 FF**: "af는 요구가 아니라 **경계조건**이다. 작게 잡으면 싸지는 게 아니라, 실제로
+  움직이는 것보다 평평하게 도착하도록 jerk를 쓰게 만든다." 이 리그는 af=0이었다 —
+  §19에서 고친 `target_velocity=0` 버그의 한 미분 위.
+- **IK 감쇠**: `dq = V diag(σ/(σ²+λᵢ²)) Uᵀ err`, `λᵢ² = 0.02²` (+ `0.08²(1-(σ/0.10)²)` if σ<0.10).
+  이 리그는 λ²=1e-4 균일이라 기본 4배, 특이영역에서 최대 **68배** 덜 감쇠했다.
+  실측 σ_min p10이 **0.07~0.16**이라 이 팔은 eps=0.10 경계에 상주한다.
+  σ=0.03에서 역이득이 리그 30.0 vs 실기 4.2 (**7배**).
+
+### 함께 고친 리그 자체 버그 (실기에는 없던 것)
+
+1. **팔로워가 절대 rotvec을 Ruckig 축 3-5에 넣고 있었다.** 이 태스크 자세는 |rotvec|≈3.05~3.14로
+   π 경계에 상주하고 `mat_to_rotvec`이 w>=0으로 접으므로, 20초 에피소드당 12~59회 3-벡터가
+   대척점으로 점프했다(실제 회전 스텝 중앙값 0.34~0.64도인데 raw 차분 p99가 357~360도).
+   → 실기 `cartesian_chunk_follower.cpp`처럼 **쿼터니언 기준 R0 + 접선 좌표 + 매 knot 재선형화**
+   (`FOLLOWER_ROT=tangent` 기본, `abs`로 원복). 합성 knot 단위시험: abs는 참값 4.09도 대비
+   152도를 돌고 최종 자세오차 152도, tangent는 4.19도 / 0.016도.
+2. **`ACTION_MODE=anchored` knot 생성에 회전 클램프가 없었다** (위치만 클램프). delta 분기와
+   실기에는 항상 있었다. 추가 후 knot 회전 스텝 p99 10.2 → 1.9도.
+3. **velproprio 이력과 청크 앵커가 한 리스트(`cmd_hist`)를 공유했다.** 경계마다
+   `cmd_hist[-1] = anchor(FK(q_cmd))`로 덮어써서, 경계 다음 틱의 velproprio가
+   `knot − FK(q_cmd)`가 됐다. 주입량이 정상 tick 변위의 **14~32%**, 주기는 청크 경계율
+   (execute 4 → 7.35 Hz). 실기는 분리돼 있다 —
+   `openpi_remote._record_command_pose_history`는 방출된 TcpPoseTarget만 append-only로 쌓고
+   (홀드는 ZOH) velproprio는 시간 기준 1스텝 lookback + scale 정규화를 쓴다.
+   → `VELPROPRIO_ANCHOR_OVERWRITE=0` 기본(=분리), 1이면 과거 동작.
+
+### ⚠️ `tremor_um`으로 떨림 A/B를 판정하지 말 것
+
+`tremor_um`(2차차분)과 knot-band(30 Hz)는 **f² 가중**이라 떨림이 실제로 사는 **3-15 Hz에 눈이
+멀었다**. 실측 knot 30 Hz 대역 기여는 0.0%였고, 위 수정 전후로 `tremor_um`이 둘 다 ~110 um로
+똑같이 나온다. 대신 쓸 지표:
+
+- **자유공간 3-15 Hz 잔차 RMS** (0.2 s 3차 추세 제거 후; `cmd z > 20 mm`로 접촉 구간 배제)
+- **knot 회전 churn (deg/s)** 과 knot 스텝 p99 — 실기 액션 청크가 6.8~8.6 deg/s, p99 0.78~1.03도
+- **짝지은 단별 감쇠** (`refpre` → `ref`) — 같은 런·같은 시점이라 유일하게 교란이 없다
+
+### 배제된 가설 (데이터로 반박, 재의심 금지)
+
+- **q_ref ↔ q_actual 간극**: tau≈7.7 ms 1차 지연(= PhysX `kd/kp`), 에너지 95~99%가 10 Hz 아래,
+  2-15 Hz 플랜트 전달비 0.90~1.07로 **투명**. 되먹임 경로도 없다(IK는 q_cmd 위에서 적분,
+  proprio·앵커 모두 command 소스).
+- **드라이브 강성**: 같은 관절 명령을 재생하며 kp를 1e7→1e6→1e5로 100배 바꿔도 링 피크가
+  235.6/205.5 Hz에 고정. 링크 관성 0.002~0.075 kg·m²에서 드라이브 고유진동수는 1.8~11 kHz로
+  2 ms 스텝이 못 푸는 대역이다. 진폭 ~12 um(오버뷰 렌더에서 0.008 px)이라 눈에 보일 수 없다.
+- **동역학 전체**: `DRIVE_MODE=kinematic`으로 팔 관절을 매 스텝 **직후** q_ref로 강제해
+  q_actual==q_ref(cmd jerk == meas jerk, plant gain 1.00)로 만들어도 자유공간 3-15 Hz wiggle이
+  0.99 → 0.89 mm로 남았다. (스텝 **전에만** 쓰면 한 스텝 적분이 남아 키네마틱이 아니다.)
+- **컨트롤박스**: 필터가 아니라 **순수 지연**이다. 배포 펌웨어 v8.7.3 + queue_sync(5) +
+  `servo_alpha 10`(내부 LPF OFF) 실측 — `box delay = RBACK queue fill + 1 tick`, sent→ref
+  8.17/8.03 tk, end-to-end 11.14/11.13 tk (22.3 ms). `servo_t2_sec`은 hold time이고
+  `docs/servo_backend_contract.md`가 "**not UR-style lookahead**"라고 못박고 있다.
+  `BOX_DELAY_TICKS=8`로 이식해 지연을 22.5~31.2 ms로 맞춰도 떨림은 불변(전달비 여전히 ~1).
+- **`smoothing_window`**: 실기도 **1(꺼짐)** 이라 차이가 아니다.
+
+### 남은 격차 (아직 안 맞춘 것)
+
+- **정책 청크의 회전 요구량**: 실기 액션 청크가 6.8~8.6 deg/s(스텝 p99 0.78~1.03도, `ANG_V*dt`
+  1.72도 초과 **0.0%**)인데 이 리그의 anchored 40k는 12.8~63.2 deg/s(p99 3.4~10.2도, 초과 3~41%).
+  약 3배다. 체크포인트 차이인지(실기 로그는 delta v1) 렌더 OOD인지 리그 디코딩 결함인지 미판정.
+  가르는 방법: **:8001에 delta 체크포인트를 띄우고 delta 모드로 같은 측정**. GPU를 프로덕션
+  추론과 공유하므로 스케줄링 주의.
+- `BOX_DELAY_TICKS` 기본 0. 실측 기반이라 8이 충실하지만, 과거 모든 평가와의 비교 가능성 때문에
+  기본값 변경은 보류. 켤 때 std20 동등성 확인 후.
+
+### 새 환경변수 (전부 실기 값이 기본)
+
+| 노브 | 기본 | 의미 |
+|---|---|---|
+| `OUTPUT_SMD` | **1** | `output_smd.enable`. 0이면 이식 전 리그 |
+| `SMD_NF_LINEAR_HZ` / `SMD_NF_ANGULAR_HZ` | 3.5 / 2.5 | SMD 고유주파수 |
+| `SMD_DAMPING_RATIO` / `SMD_VELOCITY_FF` / `SMD_VELOCITY_FF_LPF_HZ` | 1.0 / 1 / 0 | |
+| `IK_MODE` | **real** | `legacy`면 λ²=1e-4 균일 DLS |
+| `IK_DAMPING` / `IK_DAMPING_MAX` / `IK_SINGULAR_EPS` | 0.02 / 0.08 / 0.10 | |
+| `IK_MAX_ITERS` / `IK_POS_TOL_M` / `IK_ORI_TOL_RAD` | 100 / 2e-5 / 2e-4 | |
+| `LIN_JERK` / `ANG_JERK` | 2000 / 4000 | |
+| `AF_BETA_LIN` / `AF_BETA_ANG` | 1.0 / 1.0 | 가속 FF 감쇠 |
+| `CORNER_VELOCITY_SCALE` / `CORNER_DEADBAND_LIN_M` / `CORNER_DEADBAND_ANG_RAD` | 0.25 / 3e-4 / 5e-4 | |
+| `FOLLOWER_ROT` | **tangent** | `abs`면 절대 rotvec (버그 재현용) |
+| `VELPROPRIO_ANCHOR_OVERWRITE` | **0** | 1이면 앵커가 velproprio 이력을 덮어씀 |
+| `BOX_DELAY_TICKS` | 0 | 컨트롤박스 FIFO 지연 [2 ms 틱]. 실측 8 |
+| `DRIVE_MODE` | drive | `kinematic`은 진단 전용(파지가 죽는다) |
+
+### 측정 결과 (n=2, 롤아웃이 갈라지므로 크기는 참고용)
+
+자유공간 3-15 Hz **실측 잔차**가 이식 전 대비 **좌 1.136 → 0.513 mm (-54.8%) / 우 1.214 → 0.817 mm
+(-32.7%)**. 관절 wiggle은 좌 -65.2%인데 우가 +33.9%로 갈리는데, n=2에 롤아웃이 갈라지므로
+관절 쪽 부호는 아직 못 믿는다. **짝지은** SMD 감쇠(같은 런·같은 시점 `refpre`→`ref`)만이
+교란이 없는 수치이고 **2.0~2.4배**로 4개 arm-run 전부 일관했다.
+IK는 20 um 허용오차 내 **100% 수렴**(잔차 p50 0.7~3.5 um).
+
+**과제 성적은 내려갔다**: correct 3→2, grasp 4→2, lifted 3→3 (중간 단계인 corner 가드 이전
+구성은 1/2/2였다). n=2라 판정은 아니지만, **원칙상 성공률을 이유로 되돌리지 않는다.** SMD lag가 이 리그에서 p50 0.94~2.97 mm로
+실기(0.84 quiet / 1.22 vibrating)의 1.1~3.5배인 것이 후보다 — lag는 `3a/wn²`이라 리그가 가속을
+더 요구하는 만큼 더 문다. 즉 이것도 "리그가 실기보다 거친 명령을 받고 있다"는 위 미판정 항목의
+증상이다. 확정은 **std20**으로.
+
+산출물: `outputs/eval/compare_{rotfix,boxdelay,kinematic,fx,parity}_{00,01}.mp4`,
+diag npz(`TREMOR_DIAG=1`)에 `qact`/`qdact`/`knot`/`ref`/`refpre` 채널 추가.

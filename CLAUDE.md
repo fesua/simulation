@@ -1170,9 +1170,48 @@ pad/v2_nolang/velgrip_real = gripabs. `_checkpoint_contract()`가 서빙 프로�
 `--policy.dir`에서 이걸 읽고, **`ACTION_MODE`와 다르면 시작 시 abort**한다.
 계약은 summary provenance(`checkpoint_contract`)에도 남는다.
 
-탈출구는 `ALLOW_CONTRACT_MISMATCH=1` 하나뿐이고 **명시적으로 타이핑해야** 한다 —
+### 집 규칙: 계약 문제는 경고가 아니라 종료다 (운영자, 2026-09-04)
+
+**이 부류의 실패는 전부 시끄러운 에러 + 종료로 만든다.** 근거는 이번 사고 자체다 — 계약이
+틀린 런은 `blank_obs 0`, close 이벤트 기록, mp4 정상, 지연 정상으로 **건강해 보이는 요약**을
+남긴다. 200줄짜리 시작 로그 속의 WARNING은 침묵과 구분되지 않고, **숫자가 로그보다 오래 산다.**
+
+`_abort_unverified()`로 통일했고 다음이 전부 종료 대상이다:
+
+| 경로 | 이전 | 지금 |
+|---|---|---|
+| `ACTION_MODE` ↔ 체크포인트 학습 모드 불일치 | 없음(무검사) | **ABORT** |
+| 체크포인트 계약을 못 읽음 | WARNING 후 진행 | **ABORT** |
+| anchored인데 norm stats 없음 (RTC가 vanilla로 강등) | WARNING 후 진행 | **ABORT** |
+| 서버 `action_horizon` ≠ 리그 `ACTION_HORIZON` | 무검사 | **ABORT** |
+| 서버 `action_dim` < 14 | 무검사 | **ABORT** |
+| 손목캠 빈 프레임 (**첫 관측 이후**) | 계수 후 요약에 `!! INVALID RUN` 표시, 채점은 계속 | **즉시 ABORT** |
+
+마지막 줄이 특히 중요하다. 예전엔 첫 관측만 막았고 이후에 검은 프레임이 들어오면 남은 에피소드
+내내 검은 이미지로 정책을 채점한 뒤 끝에 표시만 붙였다 — 그 표시를 읽을 때쯤이면 mp4와 점수가
+이미 존재하고 멀쩡해 보인다.
+
+### ⚠️ `raise SystemExit`은 이 프로세스를 끝내지 못한다
+
+가드를 넣고 시험하다 발견했다. 계약 게이트가 **t+16초에 메시지를 찍고, 프로세스는 t+400초에
+외부 timeout이 죽일 때까지 그대로 앉아 있었다.** Isaac의 `SimulationApp`이 non-daemon 스레드를
+붙들고 있어서 처리되지 않은 `SystemExit`이 `main()`을 풀고 나와도 인터프리터가 못 나간다.
+**찍고 멈추는 가드는 절반짜리다** — `run_std20.sh`는 `PIPESTATUS`를 보는데 아무것도 못 보고,
+큐로 돌리는 스윕은 다음으로 넘어가지 않고 멈춘다.
+
+그래서 `_die()`로 통일했다: 양쪽 스트림 flush → `os._exit(1)`. 앱 생성 이후의 모든 치명 경로
+(계약 게이트·GRIP_MAXF·FINGER_FRICTION·scene-states 누락·빈 손목 프레임)가 이걸 쓴다.
+
+**`SimulationApp.close()`를 먼저 부르면 안 된다.** Isaac이 `--/app/fastShutdown=True`로 돌아서
+`close()`가 프로세스를 **상태 0으로** 직접 끝내버린다 — 첫 버전이 정확히 그랬고, abort를 찍고
+18초에 종료하면서 **성공을 보고했다**. 런타임만 짧아진 같은 조용한 통과다. GPU 컨텍스트는
+프로세스가 죽으면 커널이 회수하므로 close()가 지켜줄 것 중에 틀린 종료코드와 바꿀 만한 건 없다.
+실측: 수정 후 `exit=1`, 17초.
+
+탈출구는 **`ALLOW_UNVERIFIED_CONTRACT=1` 하나뿐**이고 명시적으로 타이핑해야 한다 —
 STATE_MODE/ACTION_MODE는 애초에 인터페이스 실험용으로 만든 노브라(§18) 막기만 하는 게이트는
-틀린 종류의 엄격함이지만, 기본값으로 새어나가면 이번 사고가 반복된다.
+틀린 종류의 엄격함이지만, 기본값으로 새어나가면 이번 사고가 반복된다. 켜면 로그에
+`!! UNVERIFIED CONTRACT ALLOWED ... This run is an experiment, not a score.`가 찍힌다.
 
 ### 함께 막은 지뢰: RTC norm stats 하드코딩
 

@@ -175,6 +175,65 @@ def _load_rtc_norm_stats(path: str) -> bool:
     return True
 
 
+def _die(msg: str) -> None:
+    """Print loudly and EXIT. Not `raise SystemExit` -- that does not end this process.
+
+    Measured 2026-09-04: the contract gate raised SystemExit at t+16 s, the message printed,
+    and the process then sat there until an external timeout killed it at t+400 s. Isaac's
+    SimulationApp keeps non-daemon threads alive, so an unhandled SystemExit unwinds main()
+    and the interpreter never gets to leave. A guard that prints and hangs is only half a
+    guard: nothing downstream (run_std20.sh reads PIPESTATUS) sees a failure, and a queued
+    sweep stalls instead of moving on.
+
+    So: flush both streams, then os._exit -- which cannot be blocked by a lingering thread.
+
+    It does NOT call SimulationApp.close() first, and that is not an oversight. Isaac runs
+    with `--/app/fastShutdown=True`, so close() ends the process itself, with status 0:
+    the first version of this helper printed the abort, terminated in 18 s, and STILL
+    reported success, which is the same silent pass wearing a shorter runtime. run_std20.sh
+    keys off PIPESTATUS and would have gone on to write a t1 report for a run that never
+    scored anything. The kernel reclaims the GPU context when the process dies, so there is
+    nothing close() protects that is worth the wrong exit code.
+    """
+    # stderr only. Writing to both duplicated it in every log this repo keeps, because the
+    # wrappers all merge (run_std20.sh: `2>&1 | tee`) and Isaac re-echoes stderr through its
+    # own logger on top of that -- three copies of the same abort. stderr is the stream a
+    # fatal belongs on and the one every wrapper already captures.
+    try:
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - a dying process must not die harder
+        pass
+    try:
+        sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(1)
+
+
+def _abort_unverified(what: str, why: str) -> None:
+    """Kill the run over an interface the rig could not verify against the served model.
+
+    The house rule, after 2026-09-04 (operator): a contract problem is a LOUD ERROR AND AN
+    EXIT, never a warning the run continues past. Every failure in this class produces a
+    summary that looks healthy -- blank_obs 0, close events logged, video written, latency
+    normal -- and is scored as if it meant something. A warning in a 200-line startup log
+    is indistinguishable from silence, and the number outlives the log.
+
+    ONE escape hatch for the whole class, and it has to be typed rather than defaulted,
+    because this rig does run deliberate interface experiments (section 18).
+    """
+    if os.environ.get("ALLOW_UNVERIFIED_CONTRACT") == "1":
+        print(f"[eval] !! UNVERIFIED CONTRACT ALLOWED: {what}\n"
+              f"       ({why})\n"
+              f"       This run is an experiment, not a score.")
+        return
+    _die(f"ABORT: {what}.\n"
+         f"  Why this is fatal: {why}.\n"
+         f"  Fix the mismatch, or set ALLOW_UNVERIFIED_CONTRACT=1 if running it "
+         f"knowingly IS the experiment.")
+
+
 def _checkpoint_contract(policy_dir: str) -> dict:
     """What ACTION contract the served checkpoint was TRAINED under, read from the
     checkpoint itself.
@@ -1053,9 +1112,8 @@ def main() -> int:
                     _n += 1
         print(f"  [grip] finger drive maxForce = {_maxf} N on {_n} joint(s)")
         if _n == 0:
-            raise SystemExit("ABORT: GRIP_MAXF set but no finger joints found -- the limit would "
-                             "have been silently ignored and the run would look like a physics "
-                             "result.")
+            _die("ABORT: GRIP_MAXF set but no finger joints found -- the limit would "
+                 "have been silently ignored and the run would look like a physics result.")
 
     sbox("/World/scene/table", (TABLE["cx"], TABLE["cy"], -TABLE["thick"]),
          (TABLE["hx"], TABLE["hy"], TABLE["thick"]), "table")
@@ -1143,8 +1201,8 @@ def main() -> int:
                 _n += 1
         print(f"  [phys] finger/table friction {_fmu} on {_n} collider(s)")
         if _n == 0:
-            raise SystemExit("ABORT: FINGER_FRICTION set but no finger/table colliders matched "
-                             "-- the run would look like a physics result while changing nothing.")
+            _die("ABORT: FINGER_FRICTION set but no finger/table colliders matched "
+                 "-- the run would look like a physics result while changing nothing.")
 
 
     key = UsdLux.DistantLight.Define(stage, "/World/key")
@@ -1634,34 +1692,49 @@ def main() -> int:
             print(f"[eval] served checkpoint trained on {_con['dataset']} "
                   f"-> action_mode={_con['action_mode']}")
             if _con["action_mode"] != ACTION_MODE:
-                # The escape hatch is deliberate: STATE_MODE/ACTION_MODE exist BECAUSE this
-                # rig runs interface experiments (section 18), and a gate with no override
-                # would be the wrong kind of strict. But it has to be typed, not defaulted.
-                msg = (f"ACTION_MODE={ACTION_MODE} but the served checkpoint was trained "
-                       f"{_con['action_mode']} ({_con['dataset']}). Decoding anchored rows "
-                       f"as chained deltas puts the command ~24 waypoints past the anchor "
-                       f"every chunk; the run scores 0 and looks normal doing it "
-                       f"(measured 2026-09-04: bolt 270.6 mm below the closing jaw).")
-                if os.environ.get("ALLOW_CONTRACT_MISMATCH") != "1":
-                    raise SystemExit(
-                        f"ABORT: {msg}\n"
-                        f"  Re-run with ACTION_MODE={_con['action_mode']}.\n"
-                        f"  If the mismatch IS the experiment, set "
-                        f"ALLOW_CONTRACT_MISMATCH=1 to proceed.")
-                print(f"[eval] !! CONTRACT MISMATCH ALLOWED: {msg}")
+                _abort_unverified(
+                    f"ACTION_MODE={ACTION_MODE} but the served checkpoint was trained "
+                    f"{_con['action_mode']} ({_con['dataset']}) -- re-run with "
+                    f"ACTION_MODE={_con['action_mode']}",
+                    "decoding anchored rows as chained deltas puts the command ~24 "
+                    "waypoints past the anchor every chunk; measured 2026-09-04, the "
+                    "gripper closed with the bolt 270.6 mm below it and the run still "
+                    "wrote a clean-looking summary")
             if ACTION_MODE == "anchored" and not RTC_NORM_STATS:
                 # From the SERVED checkpoint, never a hardcoded path -- the re-anchor is
                 # SE(3) algebra and needs THIS model's action q01/q99 to unnormalise.
                 _load_rtc_norm_stats(_con["norm_stats"])
         else:
-            print(f"[eval] WARNING: could not read the served checkpoint's action contract "
-                  f"({_ck.get('dir', 'unresolved')}); ACTION_MODE={ACTION_MODE} is "
-                  f"UNVERIFIED against the model.")
+            _abort_unverified(
+                f"could not read the served checkpoint's action contract "
+                f"(dir={_ck.get('dir') or _ck.get('why', 'unresolved')}), so "
+                f"ACTION_MODE={ACTION_MODE} is UNVERIFIED against the model",
+                "the whole point of the gate is that an unverified contract is the state "
+                "the 2026-09-04 run was in")
         if RTC_NORM_STATS:
             _load_rtc_norm_stats(RTC_NORM_STATS)
         if ACTION_MODE == "anchored" and _RTC_NORM_Q is None:
-            print("[eval] WARNING: anchored but no norm stats -> RTC prev-chunk "
-                  "conditioning DISABLED (vanilla sampling)")
+            _abort_unverified(
+                "ACTION_MODE=anchored but no action norm stats could be loaded",
+                "the anchored RTC re-anchor is SE(3) algebra on UNNORMALISED values, so "
+                "without them RTC prev-chunk conditioning silently degrades to vanilla "
+                "sampling -- a different algorithm wearing the same --rtc flag")
+        # The horizon is the one thing the server DOES tell us, and the rig hardcodes it
+        # (ACTION_HORIZON, RESERVE_STEPS lookahead, the RTC delay). A checkpoint served at
+        # a different horizon would be sliced against the wrong assumptions.
+        _sh = (server_metadata or {}).get("action_horizon")
+        if _sh is not None and int(_sh) != ACTION_HORIZON:
+            _abort_unverified(
+                f"the server serves action_horizon={_sh} but the rig is built for "
+                f"ACTION_HORIZON={ACTION_HORIZON}",
+                "chunk integration, the reserve lookahead and the RTC delay are all "
+                "written against the rig's horizon")
+        # 14 valid dims, read as two 7-wide arm blocks. Anything narrower is not this task.
+        _sd = (server_metadata or {}).get("action_dim")
+        if _sd is not None and int(_sd) < 14:
+            _abort_unverified(
+                f"the server serves action_dim={_sd}, below the 14 this task decodes",
+                "the rig slices [left 7 | right 7] out of every row")
     else:
         print("ORACLE mode: privileged-state planner, no policy server")
         server_metadata = None
@@ -1800,9 +1873,8 @@ def main() -> int:
         if args.scene_states:
             frozen = _SCENE_STATES.get(str(ep_seed))
             if frozen is None:
-                raise SystemExit(
-                    f"--scene-states has no entry for seed {ep_seed}; regenerate it "
-                    "with --dump-scene-states for this layout/n-per-color")
+                _die(f"ABORT: --scene-states has no entry for seed {ep_seed}; regenerate "
+                     "it with --dump-scene-states for this layout/n-per-color")
         if frozen is not None:
             # Exact settled world: position + orientation + zero velocity per bolt.
             for path, st in zip(bolt_prims, frozen["bolts"]):
@@ -1994,8 +2066,19 @@ def main() -> int:
                     if arr is None or arr.size == 0:
                         # NEVER let this pass quietly: a black observation is not a policy
                         # result, it is a broken harness, and it scores 0 while looking real.
-                        arr = np.zeros((480, 640, 4), dtype=np.uint8)
+                        # Until 2026-09-04 only the FIRST blank aborted; a blank appearing
+                        # later was counted, flagged in the summary, and the run carried on
+                        # scoring the policy on black frames for the rest of the episode.
+                        # Operator rule: loud error and exit, not a marker on a finished
+                        # number -- by the time anyone reads the marker the mp4 and the
+                        # score already exist and look normal.
                         blank_obs[side] += 1
+                        _die(f"ABORT: the {side} wrist camera returned an empty frame at "
+                             f"episode {ep}, tick {tick}. The policy would be scored on a "
+                             f"black image.\n"
+                             f"  The renderer is not filling its annotators -- check that "
+                             f"rep.orchestrator.step() runs every policy tick (it must not "
+                             f"be gated on --video; see CLAUDE.md section 20).")
                     imgs[side] = arr[..., :3].astype(np.uint8)
                 if DUMP_OBS and tick % 30 == 0:
                     for side in ("left", "right"):
@@ -2092,7 +2175,11 @@ def main() -> int:
                 _activate(_infer(_observe()))
                 chunk_idx = 0
                 if sum(blank_obs.values()):
-                    raise SystemExit(
+                    # Belt and braces. _observe() now aborts on ANY blank frame, so this
+                    # cannot fire; it stays because the first observation is the one that
+                    # used to be checked and losing the check outright would be a
+                    # regression if _observe's guard is ever loosened.
+                    _die(
                         "ABORT: the wrist cameras returned empty frames on the FIRST observation "
                         "-- the policy would be scored on black images. The renderer is not "
                         "filling its annotators; check that rep.orchestrator.step() runs every "
@@ -2773,7 +2860,9 @@ def main() -> int:
         # Rank models on this, not on total_correct.
         total_grasp_linked=sum(1 for r in results for p in r["placements"]
                                if p.get("grasp_t") is not None),
-        # If this is not 0 the run is INVALID: the policy saw black wrist frames.
+        # Always 0 in a run that finished: a blank frame now aborts on the spot. Kept as
+        # the field older summaries are read through, and as the check that would catch a
+        # future path which counts a blank without raising.
         blank_obs=sum(v for r in results for v in r["blank_obs"].values()),
         t1=t1,
         provenance=_safe_provenance(args, server_metadata),

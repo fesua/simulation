@@ -35,6 +35,7 @@ import pathlib
 import time
 
 import os
+import sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -211,6 +212,13 @@ if DUMP_OBS:
 # features to the tool-frame bolt position and comparing probe error with aim error per stratum.
 PROBE_DUMP = os.environ.get("EVAL_PROBE_DUMP") or ""
 PROBE_EVERY = int(os.environ.get("EVAL_PROBE_EVERY", "10"))
+# EVAL_PROBE_NOIMG=1 keeps every field EXCEPT the wrist PNGs. The approach-profile questions --
+# how far the plan travels as the gap closes, and where the jaw command is while it does -- are
+# answered by `chunk`, `bolts_tool` and `grip`, all of which are already recorded; only offline
+# RE-QUERYING of the policy needs pixels. Dropping them turns a 20-episode every-tick trace from
+# ~36k PNGs into ~150 MB of JSON, which is what makes the right arm's approach measurable at all
+# (the 4-episode image dump yielded 1-11 right-arm approach ticks per distance bucket).
+PROBE_NOIMG = os.environ.get("EVAL_PROBE_NOIMG") == "1"
 if PROBE_DUMP:
     os.makedirs(PROBE_DUMP, exist_ok=True)
 # Replay drives the recorded joint-command stream verbatim, so the bolts-vs-no-bolts
@@ -426,6 +434,93 @@ def bolt_poses(layout, n_per, seed):
             out.append((color, PILE_X + rng.normal(0, 0.07),
                         rng.uniform(-0.30, 0.30), rng.uniform(0, math.pi)))
     return out
+
+
+def _resolve_served_checkpoint(host: str, port: int) -> dict:
+    """Recover WHICH checkpoint answered this run by reading the local server's cmdline.
+
+    The websocket metadata carries only {action_horizon, action_dim} -- nothing identifying -- so
+    every summary written so far is unattributable to a checkpoint. Scanning /proc is the only
+    source that cannot drift from what actually served. Remote hosts are unresolvable; say so
+    rather than leaving the field silently empty.
+    """
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return {"resolved": False, "why": f"non-local host {host}"}
+    hits = []
+    for pd in pathlib.Path("/proc").iterdir():
+        if not pd.name.isdigit():
+            continue
+        try:
+            argv = (pd / "cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if not any("serve_policy" in a for a in argv):
+            continue
+        if str(port) not in argv:
+            continue
+        got = {"pid": int(pd.name), "argv": [a for a in argv if a]}
+        for flag, key in (("--policy.dir", "dir"), ("--policy.config", "config"),
+                          ("--num-medoid-samples", "num_medoid_samples")):
+            if flag in argv:
+                got[key] = argv[argv.index(flag) + 1]
+        hits.append(got)
+    if len(hits) != 1:
+        return {"resolved": False, "why": f"{len(hits)} serve_policy processes matched port {port}",
+                "candidates": hits}
+    return {"resolved": True, **hits[0]}
+
+
+def _safe_provenance(args, server_metadata: dict | None) -> dict:
+    """Never let provenance collection destroy a finished run.
+
+    Learned the hard way on 2026-09-02: a NameError in here killed the summary write of three
+    completed 20-episode A/B runs (~2.5 h of simulation) AFTER every episode had been scored. The
+    numbers are the product; the metadata about them is not worth risking them for.
+    """
+    try:
+        return _provenance(args, server_metadata)
+    except Exception as e:  # noqa: BLE001 - deliberately broad; this must not raise
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _provenance(args, server_metadata: dict | None) -> dict:
+    """Everything needed to re-run this exact configuration, recorded WITH the numbers.
+
+    Written because the 2026-08 summaries cannot be compared: `DC_*` reports dz p50 ~140 mm and
+    `G23*` ~20 mm, and nothing on disk says which knobs, rig revision, or checkpoint produced
+    either. A number without its knobs is not a measurement.
+    """
+    import hashlib
+    src = pathlib.Path(__file__).read_bytes()
+    prefixes = ("GRIP_", "BOLT_", "FINGER_", "ORACLE_", "EVAL_", "TREMOR_", "RTC_")
+    names = ("STATE_MODE", "ACTION_MODE", "IK_LAMBDA", "CUDA_VISIBLE_DEVICES", "OMNI_KIT_ACCEPT_EULA")
+    return {
+        "rig": {
+            "script": str(pathlib.Path(__file__).resolve()),
+            "sha256": hashlib.sha256(src).hexdigest()[:16],
+            "argv": sys.argv[1:],
+        },
+        "policy_server": {
+            "host": args.host, "port": args.port,
+            "metadata": server_metadata,
+            "checkpoint": _resolve_served_checkpoint(args.host, args.port),
+        },
+        # Vars the operator SET (verbatim) ...
+        "env": {k: v for k, v in sorted(os.environ.items())
+                if k.startswith(prefixes) or k in names},
+        # ... and the values that actually APPLIED, defaults included.
+        "effective": {
+            "GRIP_PROPRIO": GRIP_PROPRIO, "GRIP_LEAD": GRIP_LEAD, "GRIP_BIAS": GRIP_BIAS,
+            "GRIP_LAG_MS": GRIP_LAG_MS, "GRIP_FLOOR": GRIP_FLOOR,
+            "STATE_MODE": STATE_MODE, "ACTION_MODE": ACTION_MODE, "IK_LAMBDA": IK_LAMBDA,
+            "ORACLE_ARM": ORACLE_ARM, "ORACLE_RETURN": ORACLE_RETURN,
+            # rtc / execute_steps / prefetch_at are recorded as top-level summary fields;
+            # PREFETCH_AT in particular is a local of main(), not a module global.
+            # Grasp accounting changed on 2026-09-02 (the detector fix). Summaries without this
+            # marker undercount grasps and must not be compared against ones that have it.
+            "grasp_detector": "fixed_20260902",
+        },
+    }
 
 
 def main() -> int:
@@ -1149,9 +1244,12 @@ def main() -> int:
         websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
     print(f"connected to {args.host}:{args.port}")
     if client is not None:
-        print(f"server metadata: {client.get_server_metadata()}")
+        server_metadata = client.get_server_metadata()
+        print(f"server metadata: {server_metadata}")
+        
     else:
         print("ORACLE mode: privileged-state planner, no policy server")
+        server_metadata = None
 
     def tcp_pose(side):
         pos, quat = tcp_views[side].get_world_poses()
@@ -1376,7 +1474,7 @@ def main() -> int:
         pending = None           # (full chunk (H,14), obs_tick) kicked at prefetch_at, swapped at boundary
         prev_grip = {s_: 100.0 for s_ in MOUNT_FRAME}
         close_events = []        # per gripper-close command: TCP-vs-nearest-bolt error, grasp outcome
-        grasp_checks = []        # (event_index, bolt_path, bolt_z0, side, due_tick)
+        grasp_checks = []        # [event_idx, bolt_idx, bolt_path, bolt_z0, side, deadline, latched]
         # T1: per tick, index of the bolt nearest this arm's 24-step-ahead chunk endpoint.
         # Changes in this series ARE target switches -- the "bolt hopping" the multimodal
         # conditional would produce at a chunk boundary.
@@ -1761,8 +1859,12 @@ def main() -> int:
                     # opening (GRIP_OPEN=50) crosses ~17 ticks sooner relative to the lift, so
                     # at +45 the lift had barely begun and every real grasp scored False
                     # (orcP0: grasped 0/22 while PLACING 8 -- the placements are the proof).
-                    grasp_checks.append((len(close_events) - 1, bolt_prims[bi_], float(bp[2]),
-                                         side, tick + 75))
+                    # tick+75 is now a DEADLINE, not the sampling instant: the window below is
+                    # polled every tick and latches on the first success. Carries the bolt INDEX
+                    # so the poll can read the already-fetched `_bxy` instead of a per-bolt round
+                    # trip. Fields: (event, bolt_idx, prim, z_at_close, side, deadline, latched).
+                    grasp_checks.append([len(close_events) - 1, bi_, bolt_prims[bi_],
+                                         float(bp[2]), side, tick + 75, False])
                     # EJECTION probe. The finger joints run the same kp=1e7 position drive as
                     # the arm, and grip 0 commands them 47 mm inward -- straight through an
                     # 18.4 mm bolt head. A real gripper stalls its motor at finite force; this
@@ -1772,14 +1874,22 @@ def main() -> int:
                                         float(np.linalg.norm(_bxy[bi_] - bp)), bp.copy()])
                 prev_grip[side] = grip_cmd[side]
             if PROBE_DUMP and tick % PROBE_EVERY == 0 and _bxy is not None:
-                rec = dict(ep=ep, seed=ep_seed, tick=tick, t=tick * POLICY_DT)
+                # `state` is the exact 14-D vector handed to the policy this tick. Storing it makes
+                # the dump REPLAYABLE offline as single-shot infer() calls, which is what separates
+                # "the sim pixels are out of distribution" from "the closed loop drifts": same
+                # image, same state, no loop.
+                rec = dict(ep=ep, seed=ep_seed, tick=tick, t=tick * POLICY_DT,
+                           state=[float(v) for v in state])
                 for side in ("left", "right"):
                     a = wrist_cams[side].get_rgba()
                     arr = np.asarray(a) if a is not None else None
                     if arr is None or arr.size == 0:
                         continue
                     fn = f"pr_{args.tag}_{ep:02d}_{tick:04d}_{side}.png"
-                    imageio.imwrite(pathlib.Path(PROBE_DUMP) / fn, arr[..., :3].astype(np.uint8))
+                    if PROBE_NOIMG:
+                        fn = None
+                    else:
+                        imageio.imwrite(pathlib.Path(PROBE_DUMP) / fn, arr[..., :3].astype(np.uint8))
                     p_t, R_t = tcp_pose(side)
                     d_all = np.linalg.norm(_bxy[:, :2] - p_t[:2], axis=1)
                     # ALL bolts, not the nearest three: the probe that reads these has to work in
@@ -1795,6 +1905,11 @@ def main() -> int:
                         bolts_world=[[float(v) for v in _bxy[i]] for i in order],
                         bolts_tool=[[float(v) for v in (R_t.T @ (_bxy[i] - p_t))] for i in order],
                         bolt_colors=[colors[i] for i in order],
+                        # The (H,7) rows the knots above were integrated from. With this, an
+                        # offline replay can tell "the policy emitted a different chunk" apart
+                        # from "the chunk->knots conversion lost the motion" -- the two are
+                        # indistinguishable from `endpoint` alone.
+                        chunk=[[float(v) for v in row] for row in np.asarray(chunk[side])],
                     )
                 with open(pathlib.Path(PROBE_DUMP) / f"probe_{args.tag}.jsonl", "a") as fh:
                     fh.write(json.dumps(rec) + "\n")
@@ -1810,13 +1925,36 @@ def main() -> int:
             eject_watch = still_e
 
             # resolve pending grasp checks: did the nearest bolt come up with the gripper?
+            #
+            # POLLED, not sampled at the deadline. Reading the condition only at close+2.5 s
+            # scored a SUCCESSFUL pick-and-place as "not grasped": measured transport is 0.0-0.4 s,
+            # so by +2.5 s the bolt is already in the box (low z) with the jaw reopened, and both
+            # terms of the test are false. Worse, `held` was populated at the deadline while the
+            # placement loop below reads it every tick, so the box entry was always recorded
+            # BEFORE the grasp resolved -> grasp_t=None. Together these made the two arms that
+            # actually pick look identical to arms that only shove bolts across the table
+            # (measured: 15 placements, 0 grasp-linked). Latching on the first tick the bolt is
+            # up-and-held fixes detection and attribution at once. The deadline survives as the
+            # negative timeout, and achieved_gap_mm is still read there so its meaning is
+            # unchanged.
             still = []
-            for (ei, path, z0, side_, due) in grasp_checks:
+            for w in grasp_checks:
+                ei, bi_g, path, z0, side_, due, latched = w
+                if not latched and _bxy[bi_g][2] - z0 > 0.03 and grip_cmd[side_] < 40.0:
+                    latched = w[6] = True
+                    close_events[ei]["grasped"] = True
+                    close_events[ei]["grasp_tick"] = int(tick)
+                    # Remember who is carrying what, so a later box entry can be
+                    # attributed to an arm and to a transport duration.
+                    # Keep BOTH: a bolt that is dropped and re-grasped overwrites the
+                    # latest entry, which made transport_s collapse to ~0.2 s. The first
+                    # grasp measures the whole attempt, the last the actual carry.
+                    held.setdefault(path, (side_, tick))
+                    held_last[path] = (side_, tick)
                 if tick >= due:
-                    bz = float(np.asarray(bolt_views[path].get_world_poses()[0])[0][2])
-                    ok = bool(bz - z0 > 0.03 and grip_cmd[side_] < 40.0)
-                    close_events[ei]["grasped"] = ok
-                    # What the jaw PHYSICALLY did 1.5 s after the command: 0 = fully shut
+                    if not latched:
+                        close_events[ei]["grasped"] = False
+                    # What the jaw PHYSICALLY did 2.5 s after the command: 0 = fully shut
                     # (closed on nothing or crushed through), ~28 = stalled on a bolt head,
                     # large = never closed (jammed on the floor or a neighbour). grip_cmd
                     # cannot tell these apart; the measured finger joints can.
@@ -1827,16 +1965,8 @@ def main() -> int:
                                    if j in _nm])
                     close_events[ei]["achieved_gap_mm"] = float(
                         2.0 * (0.047 - _fp) * 1e3)
-                    if ok:
-                        # Remember who is carrying what, so a later box entry can be
-                        # attributed to an arm and to a transport duration.
-                        # Keep BOTH: a bolt that is dropped and re-grasped overwrites the
-                        # latest entry, which made transport_s collapse to ~0.2 s. The first
-                        # grasp measures the whole attempt, the last the actual carry.
-                        held.setdefault(path, (side_, tick))
-                        held_last[path] = (side_, tick)
                 else:
-                    still.append((ei, path, z0, side_, due))
+                    still.append(w)
             grasp_checks = still
 
             # ---- placement TIMING -------------------------------------------------
@@ -1994,8 +2124,8 @@ def main() -> int:
                         for sd, d in dg.items() for k, v in d.items()},
                      **{f"{sd}_tcp": np.asarray(tcp_log[sd]) for sd in dg})
             print(f"          diag -> diag_{args.tag}_{ep:02d}.npz")
-        for (ei, path, z0, side_, due) in grasp_checks:   # unresolved at episode end
-            close_events[ei]["grasped"] = False
+        for w in grasp_checks:   # unresolved at episode end: never latched inside the window
+            close_events[w[0]]["grasped"] = bool(w[6])
         n_close = len(close_events)
         n_grasp = sum(1 for e in close_events if e["grasped"])
         # ---- T1: target-track compression ---------------------------------------------
@@ -2098,9 +2228,16 @@ def main() -> int:
         rtc=RTC_ENABLED, execute_steps=CHUNK_EXECUTE_STEPS, prefetch_at=PREFETCH_AT,
         total_close=sum(r["n_close"] for r in results),
         total_grasp=sum(r["n_grasp"] for r in results),
+        # Placements that came from a CONFIRMED grasp. `total_correct` above only asks where the
+        # bolt ended up, so a policy that shoves bolts across the table into the box scores the
+        # same as one that picks them -- measured on a real arm: 15 placements, 0 grasp-linked.
+        # Rank models on this, not on total_correct.
+        total_grasp_linked=sum(1 for r in results for p in r["placements"]
+                               if p.get("grasp_t") is not None),
         # If this is not 0 the run is INVALID: the policy saw black wrist frames.
         blank_obs=sum(v for r in results for v in r["blank_obs"].values()),
         t1=t1,
+        provenance=_safe_provenance(args, server_metadata),
         records=results,
     )
     if summary["blank_obs"]:

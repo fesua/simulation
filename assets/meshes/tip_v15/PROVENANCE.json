@@ -8,7 +8,7 @@
  },
  "collision": "sdf",
  "sdf_resolution": 256,
- "mass_kg_per_finger": 0.05573777762723528,
+ "mass_kg_per_finger": 0.05579577969425294,
  "density_pla": 1240.0,
  "density_tpu": 1200.0,
  "contact_face_mm": 49.0,

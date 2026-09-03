@@ -65,17 +65,26 @@ is not re-litigated): seating shift s and extra opening e appear only as (e - s)
 so s = 1.991 / e = 3.83 and s = 0 / e = 1.83 both reproduce 98.0 exactly. Nothing computed
 here depends on the split. Do not spend hardware time separating them.
 
-MESH SURGERY. The spine mesh is an externally revised export carrying boolean residue --
-5 connected components and 10 non-manifold (valence-4) edges in the foot boss:
-    comp0  35580.0 mm3  6258 tris  the real body (carries the non-manifold edges)
-    comp1  +1970.0 mm3     8 tris  | a duplicated planar slab pair occupying one box;
-    comp2  -1909.2 mm3    12 tris  | volumes nearly cancel, winding opposed
-    comp3   +282.8 mm3    52 tris  small closed solid at the foot, kept
-    comp4    -14.1 mm3    40 tris  inverted shell = an interior void wall
-Kept: comp0 + comp3. Dropped: the slab pair and the inverted void, reported at build time
-so the surgery is never silent. robotics_lab ships the mesh as-exported (it only needs to
-render); PhysX needs to mass and collide it, so the residue is removed here. The outer
-silhouette does not change. A clean re-export is still worth having for the CAD record.
+NO MESH SURGERY -- the spine STL is used verbatim
+=================================================
+`PLA_spine_v15.STL` is not a clean solid. It is an externally revised export carrying
+boolean residue: 5 connected components and 10 non-manifold (valence-4) edges in the foot
+boss, comprising a duplicated planar slab pair whose volumes nearly cancel and one inverted
+shell that is an interior void wall.
+
+An earlier version of this script removed them. It no longer does, on the operator's
+instruction and for a good reason: THIS FILE IS WHAT WAS PRINTED. The slicer consumed these
+exact triangles, so the physical part on the robot is whatever this mesh means, residue
+included. A tidier mesh here would be a different part from the one being modelled.
+
+Checked before accepting it, because "use it as-is" still has to be safe:
+    convex hull   91684.911 mm3 both ways -- BIT-IDENTICAL, so the collider is unaffected
+    volume        35909.5 raw vs 35862.7 cleaned = 0.13%, i.e. nothing for mass
+    the strays    all interior: the slab pair sits ON an internal wall (signed distance
+                  0.00 mm) and the inverted shell 1.75-2.86 mm inside the body
+So the residue cannot reach the collider, cannot reach the outer silhouette, and cannot
+move the mass. The build still PRINTS the component inventory every time, so the file's
+condition stays on the record rather than becoming folklore.
 
 COLLISION. The old collider was `physics:approximation = "convexHull"` over the whole
 finger: 119262 mm3 against a true 31039, i.e. 3.8x, with the contact face flattened into
@@ -93,11 +102,15 @@ The spine keeps a convex hull: its own front face sits ~7.9 mm behind the blade'
 face, so hulling it cannot add material anywhere an object can reach.
 
 MASS. The finger links carry PhysicsRigidBodyAPI with NO explicit mass, so PhysX derived
-it from the collider -- from that 3.8x-inflated hull. Leaving it derived would silently
-halve the finger mass when the collider changes, so mass is set EXPLICITLY from the true
-part volumes and a stated density. Defaults are solid-material; real prints have infill,
-so TIP_DENSITY_PLA / TIP_DENSITY_TPU are knobs and the resulting mass is printed.
-(robotics_lab also owes a hardware `ft identify` re-run for tool_mass_kg after this swap.)
+it from the collider -- from that 3.8x-inflated hull, giving 119.3 g. Leaving it derived
+would silently move the mass again whenever the collider changes, so it is now explicit.
+
+The infill of the printed parts is not known, so the density used is SOLID material and
+the resulting 55.7 g/finger is an UPPER BOUND -- the real part is lighter by whatever the
+sparse infill saves. That is still far closer than what the rig had (119.3 g was over
+double a solid part). TIP_DENSITY_PLA / TIP_DENSITY_TPU are the knobs. The number that
+would settle it is a measurement, not a guess: robotics_lab owes a hardware `ft identify`
+re-run for tool_mass_kg after this swap, and that reading can be divided down to here.
 
 Run:  .venv-isaac/bin/python scripts/build_tip_v15.py
 """
@@ -155,23 +168,20 @@ def srgb_to_linear(c: float) -> float:
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
-def clean(m: trimesh.Trimesh, label: str) -> trimesh.Trimesh:
-    """Drop boolean residue: inverted shells and duplicated planar slabs. Reported, never
-    silent -- see MESH SURGERY."""
+def describe(m: trimesh.Trimesh, label: str) -> trimesh.Trimesh:
+    """Report the mesh's condition. Does NOT modify it -- see NO MESH SURGERY."""
     m = m.copy()
     m.merge_vertices()
     comps = sorted(m.split(only_watertight=False), key=lambda c: -abs(c.volume))
-    if len(comps) <= 1:
-        return m
-    keep, drop = [], []
-    for c in comps:
-        (keep if c.volume > 0 and (len(c.faces) > 40 or c.is_watertight) else drop).append(c)
-    print(f"  [{label}] {len(comps)} components: kept {len(keep)}, dropped {len(drop)}")
-    for c in drop:
-        lo, hi = c.bounds
-        print(f"        dropped vol {c.volume:+9.1f} mm3  {len(c.faces):4d} tris  "
-              f"lo=({lo[0]:8.2f},{lo[1]:6.2f},{lo[2]:8.2f})")
-    return trimesh.util.concatenate(keep)
+    if len(comps) > 1:
+        print(f"  [{label}] {len(comps)} components, watertight={m.is_watertight} "
+              f"(kept verbatim):")
+        body = comps[0]
+        for c in comps[1:]:
+            d = trimesh.proximity.ProximityQuery(body).signed_distance(c.vertices)
+            print(f"        vol {c.volume:+9.1f} mm3  {len(c.faces):4d} tris  "
+                  f"{float(np.percentile(d, 50)):+.2f} mm inside the body surface")
+    return m
 
 
 def contact_profile(meshes, zs, y=0.0):
@@ -215,7 +225,7 @@ def main() -> int:
                       f"rb_servo_server/tools/make_pika_tool_meshes.py first")
                 return 1
             prov[p.name] = hashlib.md5(p.read_bytes()).hexdigest()
-            parts[side][kind] = clean(trimesh.load(p, force="mesh"), f"{side[0]}/{kind}")
+            parts[side][kind] = describe(trimesh.load(p, force="mesh"), f"{side[0]}/{kind}")
     for k, v in sorted(prov.items()):
         print(f"  {k:28s} md5 {v}")
 
@@ -316,8 +326,10 @@ def main() -> int:
     print(f"  tpu {L['tpu'].volume:8.1f} mm3 x {DENSITY_TPU:.0f} = {m_tpu * 1e3:6.2f} g")
     print(f"  total {mass * 1e3:.2f} g, set EXPLICITLY (the rig's old finger was "
           f"{119.3:.1f} g, derived by PhysX from a hull 3.8x the true volume)")
-    print("  NOTE: solid-material densities. Printed parts have infill -- give the real "
-          "figure and rebuild with TIP_DENSITY_PLA / TIP_DENSITY_TPU.")
+    print("  UPPER BOUND: solid-material densities, infill unknown. The real parts are "
+          "lighter by whatever\n  the sparse infill saves -- still far closer than the "
+          "119.3 g the rig was using. A hardware\n  `ft identify` (robotics_lab owes one "
+          "after this swap) settles it; TIP_DENSITY_* are the knobs.")
 
     # ---- write ------------------------------------------------------------------------
     OUT_MESH.mkdir(parents=True, exist_ok=True)

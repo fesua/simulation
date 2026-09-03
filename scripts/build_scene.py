@@ -24,10 +24,21 @@ Run:  OMNI_KIT_ACCEPT_EULA=YES .venv-isaac/bin/python scripts/build_scene.py --l
 import argparse
 import json
 import math
+import os
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ARM_USD = ROOT / "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda"
+# Same PIKA_TIP knob as eval_closed_loop.py -- see the note there. Kept in sync so a scene
+# preview or a wrist-cam render never shows a different gripper than the one being scored.
+PIKA_TIP = os.environ.get("PIKA_TIP", "v15").lower()
+# Track eval_closed_loop.py's jaw model. This file used to carry its own local 0.047, so a
+# preview rendered with the v15 asset would have closed 2 mm/side short of the jaw being
+# scored -- the scene builder and the scorer must not disagree about what "closed" is.
+FINGER_TRAVEL_M = float(os.environ.get(
+    "FINGER_TRAVEL_M", "0.049" if PIKA_TIP == "v15" else "0.047"))
+ARM_USD = ROOT / ("assets/rb3_730e_pika_tip_v15/rb3_730e_pika_articulated_sim.usda"
+                  if PIKA_TIP == "v15" else
+                  "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda")
 STAND_USD = ROOT / "assets/dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usda"
 REACH = (
     pathlib.Path.home()
@@ -352,7 +363,6 @@ def main() -> int:
         # Jaw BEFORE set_joint_positions: writing the finger targets afterwards left the
         # fingers teleported to 0 (open) with only the drive chasing the closed target,
         # and they never actually closed in the render. build_cell.py had the right order.
-        FINGER_TRAVEL_M = 0.047
         finger_pos = (1.0 - args.grip / 100.0) * FINGER_TRAVEL_M
         for jn, sign in (("finger_left_joint", +1.0), ("finger_right_joint", -1.0)):
             if jn in names:
@@ -394,7 +404,8 @@ def main() -> int:
         got = np.asarray(art.get_joint_positions())
         if "finger_left_joint" in nm:
             print(f"  {side:5s} jaw grip={args.grip:5.1f} -> finger L={got[nm.index('finger_left_joint')]:+.4f} "
-                  f"R={got[nm.index('finger_right_joint')]:+.4f} m (target +-{(1-args.grip/100)*0.047:.4f})")
+                  f"R={got[nm.index('finger_right_joint')]:+.4f} m "
+                  f"(target +-{(1 - args.grip / 100) * FINGER_TRAVEL_M:.4f})")
 
     tcp_z = {}
     for side in MOUNT_FRAME:

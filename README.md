@@ -38,6 +38,7 @@ git -C ~/workspace/robotics_lab show fad2cd4^:rb_servo_server/config/stack_real.
 | FK 정합 (MuJoCo 교차검증) | 최대 0.00038 mm / 0.051° |
 | 실기-시뮬 순위 상관 | 실기 라벨 체크포인트 5/5 올바른 쪽 |
 | **파지 물리 (physics v1)** | 힘제한 스톨 + 조 지연 실측 이식. 제대로 도달한 close의 94–100% 파지, 조 간격이 M12 머리(18.4mm)에 정확히 스톨 |
+| **팁 v15 (PLA+TPU 95A)** | 실기와 동일 팁으로 교체. full-open 98.0mm(실측 일치), 유지 아치가 M12를 2.0mm/side 안착시킴(옛 평면 hull은 0.1) |
 | 호스트 동등성 | RTX 5090 ↔ RTX PRO 6000 1pp 이내 |
 
 ## 설치
@@ -99,6 +100,8 @@ env GRIP_RATE=3 GRIP_MAXF=5 ORACLE_ARM=left GRIP_OPEN=50 BOLT_SPREAD=2.5 \
 
 | 노브 | 의미 | 적용 |
 |---|---|---|
+| `PIKA_TIP` | `v15`(기본, 실기 팁) / `orig`(2026-09-04 이전 자산, A/B용) | 정책+오라클 |
+| `FINGER_TRAVEL_M` | 조 스트로크 [m]. v15 **0.049**(실측 98mm gap), orig 0.047 | 정책+오라클 |
 | `GRIP_MAXF` | 핑거 드라이브 힘 제한 [N] — 실기 모터 스톨 재현. **physics v1 = 5** | 정책+오라클 |
 | `GRIP_LAG_L/R` | 조 수송 지연 [ms] — 실기 실측 **105/209** | 정책+오라클 |
 | `GRIP_PROPRIO` | grip proprio 소스 `command`/`actual` — 배포 기본은 `actual` | 정책+오라클 |

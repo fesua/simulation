@@ -805,7 +805,8 @@ def _provenance(args, server_metadata: dict | None) -> dict:
     prefixes = ("GRIP_", "BOLT_", "FINGER_", "ORACLE_", "EVAL_", "TREMOR_", "RTC_", "BOX_",
                 "SMD_", "AF_", "IK_", "LIN_", "ANG_", "CORNER_")
     names = ("STATE_MODE", "ACTION_MODE", "IK_LAMBDA", "CUDA_VISIBLE_DEVICES", "OMNI_KIT_ACCEPT_EULA",
-             "FOLLOWER_ROT", "DRIVE_MODE", "OUTPUT_SMD", "VELPROPRIO_ANCHOR_OVERWRITE")
+             "FOLLOWER_ROT", "DRIVE_MODE", "OUTPUT_SMD", "VELPROPRIO_ANCHOR_OVERWRITE",
+             "PIKA_TIP")
     return {
         "rig": {
             "script": str(pathlib.Path(__file__).resolve()),
@@ -838,6 +839,14 @@ def _provenance(args, server_metadata: dict | None) -> dict:
             "LIMITS": {"lin_v": LIN_V, "lin_a": LIN_A, "lin_j": LIN_J,
                        "ang_v": ANG_V, "ang_a": ANG_A, "ang_j": ANG_J},
             "ORACLE_ARM": ORACLE_ARM, "ORACLE_RETURN": ORACLE_RETURN,
+            # WHICH GRIPPER WAS SCORED. Two runs on different fingertips otherwise look
+            # identical on disk, and the v15 swap moves the jaw stroke (0.047 -> 0.049),
+            # the collider (flat hull -> arched SDF) and what the wrist camera sees. The
+            # asset path is recorded, not just the flag, because the flag only names a
+            # directory that a rebuild can change underneath it.
+            "PIKA_TIP": PIKA_TIP,
+            "ARM_USD": str(ARM_USD),
+            "FINGER_TRAVEL_M": FINGER_TRAVEL_M,
             # rtc / execute_steps / prefetch_at are recorded as top-level summary fields;
             # PREFETCH_AT in particular is a local of main(), not a module global.
             # Grasp accounting changed on 2026-09-02 (the detector fix). Summaries without this

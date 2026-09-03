@@ -24,10 +24,16 @@ Run:  OMNI_KIT_ACCEPT_EULA=YES .venv-isaac/bin/python scripts/build_scene.py --l
 import argparse
 import json
 import math
+import os
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ARM_USD = ROOT / "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda"
+# Same PIKA_TIP knob as eval_closed_loop.py -- see the note there. Kept in sync so a scene
+# preview or a wrist-cam render never shows a different gripper than the one being scored.
+PIKA_TIP = os.environ.get("PIKA_TIP", "v15").lower()
+ARM_USD = ROOT / ("assets/rb3_730e_pika_tip_v15/rb3_730e_pika_articulated_sim.usda"
+                  if PIKA_TIP == "v15" else
+                  "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda")
 STAND_USD = ROOT / "assets/dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usda"
 REACH = (
     pathlib.Path.home()

@@ -1,0 +1,17 @@
+{
+ "source": "/home/plaif/workspace/robotics_lab/rb_servo_server/descriptions/meshes/robots/rb5_850e/visual/tool",
+ "md5": {
+  "pika_finger_left_pla.STL": "52c18971cf715474b4d3db1a6d6a1b0d",
+  "pika_finger_left_tpu.STL": "fd581f0a39b22a01ff912aa043db4236",
+  "pika_finger_right_pla.STL": "79976d4a6964ce98445aacf29ee089b0",
+  "pika_finger_right_tpu.STL": "6016e70b5bc4abe7ed37d86f8f4434e1"
+ },
+ "collision": "sdf",
+ "sdf_resolution": 256,
+ "mass_kg_per_finger": 0.05573777762723528,
+ "density_pla": 1240.0,
+ "density_tpu": 1200.0,
+ "contact_face_mm": 49.0,
+ "full_open_gap_mm": 98.0,
+ "finger_travel_m": 0.049
+}

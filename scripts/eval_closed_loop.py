@@ -39,7 +39,24 @@ import sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ARM_USD = ROOT / "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda"
+# FINGERTIP. The robot runs the v15 tip -- rigid PLA spine + TPU 95A blade printed in
+# #F3E600 -- and `data_v2`, which every served checkpoint is trained on, was collected with
+# it. The old one-piece dark-grey Pika tip is therefore not a neutral default: it is the
+# wrong shape against the hardware AND the wrong pixels against the training distribution,
+# in the one object the wrist camera never stops seeing. Default flipped 2026-09-03 for the
+# same reason OUTPUT_SMD was: this rig matches the robot.
+#   v15   assets/rb3_730e_pika_tip_v15   built by scripts/build_tip_v15.py
+#   orig  the pre-2026-09-03 asset. EVERY published number on this project came from it, so
+#         keep it reachable -- it is the A/B partner, not dead weight.
+# NOTE this is stage 1 of the tip swap: geometry, colour, colliders and mass. The blade is
+# still a RIGID body; stage 2 relaxes the contact parameters for 95A compliance.
+PIKA_TIP = os.environ.get("PIKA_TIP", "v15").lower()
+ARM_USD = ROOT / ("assets/rb3_730e_pika_tip_v15/rb3_730e_pika_articulated_sim.usda"
+                  if PIKA_TIP == "v15" else
+                  "assets/rb3_730e_pika_articulated_sim/rb3_730e_pika_articulated_sim.usda")
+if not ARM_USD.exists():
+    raise SystemExit(f"ABORT: PIKA_TIP={PIKA_TIP} but {ARM_USD} is missing. "
+                     f"Build it with: .venv-isaac/bin/python scripts/build_tip_v15.py")
 STAND_USD = ROOT / "assets/dual_rb3_730e_stand_ver3/dual_rb3_730e_stand_ver3.usda"
 
 PROMPT = (
@@ -87,7 +104,19 @@ RESERVE_STEPS = 4   # stack_real.yaml reserve_steps; lookahead for the central
                     # difference that gives each knot a nonzero target VELOCITY
 RTC_ENABLED = False   # isolate the follower fix first (operator: solve tremor before RTC)
 RTC_INFERENCE_DELAY = 4     # = execute_steps - prefetch_at (4 - 0)
-FINGER_TRAVEL_M = 0.047
+# JAW STROKE, per side. `finger_pos = (1 - grip/100) * FINGER_TRAVEL_M`, so this is what
+# "closed" means: at grip 0 each jaw has travelled this far and the two faces meet.
+# 0.047 was never a measurement. It was chosen so that the VENDOR CAD's finger pose would
+# close to a zero gap -- and that pose is not the open stop, it is ~3.8 mm/side inboard of
+# it (robotics_lab, 2026-09-04). A vernier across the two TPU faces reads a full-open gap
+# of ~98 mm with the jaws closing to contact, so the stroke is 98/2 = 49 mm per side.
+# The v15 tip is placed on that same measurement, so the two have to move together: at
+# 0.047 the v15 jaw would stop 2 mm/side short of closed, which on an 18.4 mm bolt head is
+# the difference between a grasp and a miss. The URDF prismatic limit is +-0.05 m, so
+# 0.049 fits without touching the joint. `orig` keeps 0.047 so the old asset still closes
+# the way every historical number was scored.
+FINGER_TRAVEL_M = float(os.environ.get(
+    "FINGER_TRAVEL_M", "0.049" if PIKA_TIP == "v15" else "0.047"))
 # "actual" = measured jaw (the deploy default), "command" = the value just sent (this rig's
 # historical behaviour). See the observation builder for why the difference is not cosmetic.
 GRIP_PROPRIO = os.environ.get("GRIP_PROPRIO", "command").lower()
@@ -2321,8 +2350,13 @@ def main() -> int:
                     _fp = np.mean([abs(float(_q[_nm.index(j)]))
                                    for j in ("finger_left_joint", "finger_right_joint")
                                    if j in _nm])
+                    # FINGER_TRAVEL_M, not a second literal 0.047: this is the same jaw
+                    # model as set_arm and the grip proprio, and the v15 tip moves it to
+                    # 0.049. A stale copy here would have reported every gap 4 mm too
+                    # narrow -- straight through the 18.4 mm stall signature this field
+                    # exists to read.
                     close_events[ei]["achieved_gap_mm"] = float(
-                        2.0 * (0.047 - _fp) * 1e3)
+                        2.0 * (FINGER_TRAVEL_M - _fp) * 1e3)
                 else:
                     still.append(w)
             grasp_checks = still
